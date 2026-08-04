@@ -901,7 +901,7 @@ class SigmaBuilder:
             # One spline evaluation for the whole grid, broadcast to every
             # AO of this subshell: sigma depends on the AO only through
             # (element, subshell), so AOs in a group share a column value.
-            out[:, cols] = vals[:, None]
+            out[:, cols] = vals[:, None] # type: ignore
         return out
 
     def at_eps1(self, eps1_ev: float) -> np.ndarray:

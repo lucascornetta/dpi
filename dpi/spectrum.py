@@ -263,7 +263,7 @@ def _resolve_sigma(cfg: Any) -> Callable[[np.ndarray], np.ndarray]:
     """Return a callable ``eps1_ev -> (nq, nbas)`` sigma grid in Mb."""
     fn = getattr(cfg, "sigma_at_eps1_grid", None)
     if callable(fn):
-        return fn
+        return fn # type: ignore
     builder = getattr(cfg, "sigma_builder", None)
     if builder is not None and hasattr(builder, "at_eps1_grid"):
         return builder.at_eps1_grid
@@ -279,7 +279,7 @@ def _resolve_pshake(cfg: Any) -> Callable[[np.ndarray], np.ndarray]:
     """Return a callable ``k_au -> (nq, nbas)`` shake-off density, a.u."""
     fn = getattr(cfg, "p_shake_at_k", None)
     if callable(fn):
-        return fn
+        return fn # type: ignore
     basis = getattr(cfg, "basis", None)
     if basis is not None:
         from .shakeoff import p_shake  # local: keeps this module import-light

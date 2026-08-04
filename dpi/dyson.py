@@ -881,7 +881,7 @@ class DysonObjects:
         p = os.fspath(path)
         if not p.endswith(".npz"):
             p += ".npz"
-        np.savez_compressed(p, **self._flatten())
+        np.savez_compressed(p, **self._flatten()) # type: ignore
         return p
 
     @classmethod

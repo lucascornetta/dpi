@@ -408,7 +408,7 @@ def build_blocks(
             "dyson.d2_ij / dyson.det_sb is None; two_electron_amplitudes_ij "
             "and det_s_beta must be evaluated for this state."
         )
-    if need_two_electron:
+    if need_two_electron and det_sb is not None:
         d2 = np.asarray(d2_ij, dtype=float)
         if d2.shape != (nbas, nbas):
             raise ModelError(
