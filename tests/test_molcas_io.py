@@ -625,7 +625,7 @@ def test_synthetic_case_rejects_inconsistent_requests():
             ({"occ_style": "natural", "n_neu_occ": 4}, "n_neu_occ >= 5"),
         ):
             try:
-                mio.write_synthetic_case(os.path.join(tmp, "x"), **kw)
+                mio.write_synthetic_case(os.path.join(tmp, "x"), **kw) # type: ignore
             except ValueError as exc:
                 assert needle in str(exc), (kw, str(exc))
             else:

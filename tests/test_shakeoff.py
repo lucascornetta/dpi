@@ -94,7 +94,7 @@ def _cartesian_amplitude(powers, alpha, weight, kvec) -> np.ndarray:
             * _hermite_1d(c, kz, alpha_j)
             * np.exp(-(kx ** 2 + ky ** 2 + kz ** 2) / (4.0 * alpha_j))
         )
-    return total
+    return total # type: ignore
 
 
 def _p_shake_brute_cartesian(basis, mu: int, k: float, n: int = 64) -> float:

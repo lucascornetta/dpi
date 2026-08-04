@@ -298,9 +298,9 @@ def test_individual_object_signs_follow_the_row_set_parity():
             want_d2 = -1.0 if p not in (holes.hole_i, holes.hole_j) else 1.0
             assert np.allclose(flip.d_i, want_di * ref.d_i, atol=1e-12), p
             assert np.allclose(flip.d_j, want_dj * ref.d_j, atol=1e-12), p
-            assert np.allclose(flip.d2_ij, want_d2 * ref.d2_ij, atol=1e-12), p
+            assert np.allclose(flip.d2_ij, want_d2 * ref.d2_ij, atol=1e-12), p # type: ignore
             # det(S^beta) spans all n rows, so it always flips.
-            assert abs(flip.det_sb + ref.det_sb) < 1e-12, p
+            assert abs(flip.det_sb + ref.det_sb) < 1e-12, p # type: ignore
 
 
 # ── frozen-orbital limit ────────────────────────────────────────────────────
@@ -320,8 +320,8 @@ def test_frozen_limit_reproduces_kronecker_deltas():
         want_i[i] = 1.0
         want_j = np.zeros(n)
         want_j[j] = 1.0
-        assert np.array_equal(froz.d_i_mo, want_i)
-        assert np.array_equal(froz.d_j_mo, want_j)
+        assert np.array_equal(froz.d_i_mo, want_i) # type: ignore
+        assert np.array_equal(froz.d_j_mo, want_j) # type: ignore
 
         # AO basis: d_i -> C_neu[:, i] exactly.
         assert np.allclose(froz.d_i, neu.coeff[:, i], atol=0.0, rtol=0.0)
@@ -373,15 +373,15 @@ def test_frozen_limit_is_the_zero_rotation_limit_of_the_relaxed_build():
             (obj.d_i, froz.d_i), (obj.d_j, froz.d_j),
             (obj.d2_ij, froz.d2_ij),
         ):
-            s = np.sign(np.sum(relaxed * frozen_obj))
+            s = np.sign(np.sum(relaxed * frozen_obj)) # type: ignore
             assert abs(s) == 1.0
             err = np.abs(relaxed - s * frozen_obj).max()
             assert err < 1e-10, err
-        assert abs(abs(obj.det_sb) - 1.0) < 1e-10
+        assert abs(abs(obj.det_sb) - 1.0) < 1e-10 # type: ignore
         assert abs(obj.p_i - 1.0) < 1e-10
         assert abs(obj.p_j - 1.0) < 1e-10
         # The MO-basis amplitude is a Kronecker delta up to that sign.
-        assert np.abs(np.abs(obj.d_i_mo) - froz.d_i_mo).max() < 1e-10
+        assert np.abs(np.abs(obj.d_i_mo) - froz.d_i_mo).max() < 1e-10 # type: ignore
 
 
 def test_relaxation_moves_the_spectroscopic_factor_below_one():
@@ -429,7 +429,7 @@ def test_spectroscopic_factor_mo_route_equals_ao_route():
                 os.path.join(tmp, style), occ_style=style
             )
             for mo, ao in ((obj.d_i_mo, obj.d_i), (obj.d_j_mo, obj.d_j)):
-                p_mo, p_ao = dy.spectroscopic_factor(mo, ao, s_ao)
+                p_mo, p_ao = dy.spectroscopic_factor(mo, ao, s_ao) # type: ignore
                 assert abs(p_mo - p_ao) < 1e-10 * max(abs(p_mo), 1.0), style
                 assert 0.0 < p_ao <= 1.0 + 1e-12
             # And the metric genuinely matters: the naive AO sum, which is
@@ -480,7 +480,7 @@ def test_det_s_beta_is_the_full_n_by_n_determinant():
             "det(S^beta) is near zero, which is the deprecated "
             "det(Q_a[:, :n-1]) fallback behaviour"
         )
-        assert abs(obj.det_sb - want) < 1e-10
+        assert abs(obj.det_sb - want) < 1e-10 # type: ignore
 
         # Recovering beta_idx from the coefficients gives the same value,
         # so the canonical row order does not depend on being told.
@@ -665,7 +665,7 @@ def test_dyson_objects_npz_round_trip():
         assert back.meta["approximation"] == obj.meta["approximation"]
         assert back.meta["approximation"] is not None
         assert back.frozen is not None
-        assert np.array_equal(back.frozen.d_i, obj.frozen.d_i)
+        assert np.array_equal(back.frozen.d_i, obj.frozen.d_i) # type: ignore
         assert back.frozen.det_sb == 1.0
         # A state built without a dipole persists lam_* as None.
         plain = dy.build_state_objects(

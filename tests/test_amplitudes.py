@@ -43,7 +43,7 @@ def test_blocks_match_explicit_sums(dyson, grid_inputs, all_terms):
 
     # Isotropic polarisation average: (1/3) sum_alpha lam^2.
     lam2 = (dyson.lam_i**2).sum(axis=1) / 3.0
-    assert np.allclose(blk.indirect_i, w @ lam2)
+    assert np.allclose(blk.indirect_i, w @ lam2) # type: ignore
 
 
 def test_g_aa_equals_explicit_double_loop(dyson, grid_inputs, all_terms):
@@ -60,7 +60,7 @@ def test_g_aa_equals_explicit_double_loop(dyson, grid_inputs, all_terms):
             for nu in range(nbas):
                 acc += d2[mu, nu] ** 2 * sigma_grid[q, mu] * w[q, nu]
         ref[q] = dyson.det_sb**2 * acc
-    assert np.allclose(blk.g_aa, ref, rtol=1e-13, atol=0.0)
+    assert np.allclose(blk.g_aa, ref, rtol=1e-13, atol=0.0) # type: ignore
 
 
 def test_g_aa_uses_sigma(dyson, grid_inputs, all_terms):
@@ -70,7 +70,7 @@ def test_g_aa_uses_sigma(dyson, grid_inputs, all_terms):
     dropped = dyson.det_sb**2 * (
         ((dyson.d2_ij**2).sum(axis=0)) @ (k2[:, None] * pshake_grid).T
     )
-    assert not np.allclose(blk.g_aa, dropped)
+    assert not np.allclose(blk.g_aa, dropped) # type: ignore
 
 
 def test_g_aa_invariant_under_mu_nu_relabel(dyson, grid_inputs, all_terms):
@@ -86,7 +86,7 @@ def test_g_aa_invariant_under_mu_nu_relabel(dyson, grid_inputs, all_terms):
         d2_ij=dyson.d2_ij.T, det_sb=dyson.det_sb,
     )
     blk_t = build_blocks(transposed, sigma_grid, pshake_grid, k2, all_terms)
-    assert np.allclose(blk.g_aa, blk_t.g_aa, rtol=1e-14, atol=0.0)
+    assert np.allclose(blk.g_aa, blk_t.g_aa, rtol=1e-14, atol=0.0) # type: ignore
 
 
 def test_c_cross_equals_explicit_double_loop(dyson, grid_inputs, all_terms):
@@ -109,7 +109,7 @@ def test_c_cross_equals_explicit_double_loop(dyson, grid_inputs, all_terms):
                     dyson.d_i[mu] * dyson.d_j[nu]
                     + dyson.d_j[mu] * dyson.d_i[nu])
         ref[q] = dyson.det_sb * acc
-    assert np.allclose(blk.c_cross, ref, rtol=1e-12, atol=1e-14)
+    assert np.allclose(blk.c_cross, ref, rtol=1e-12, atol=1e-14) # type: ignore
 
 
 def test_c_cross_is_gauge_invariant(rng, grid_inputs):
@@ -137,8 +137,8 @@ def test_c_cross_is_gauge_invariant(rng, grid_inputs):
     flip = build_blocks(FakeDyson(d_i=-d_i, d_j=-d_j, d2_ij=-d2,
                                   det_sb=-0.92),
                         sigma_grid, pshake_grid, k2, terms)
-    assert np.allclose(flip.g_aa, base.g_aa, rtol=1e-12, atol=0.0)
-    assert np.allclose(flip.c_cross, base.c_cross, rtol=1e-12, atol=0.0)
+    assert np.allclose(flip.g_aa, base.g_aa, rtol=1e-12, atol=0.0) # type: ignore
+    assert np.allclose(flip.c_cross, base.c_cross, rtol=1e-12, atol=0.0) # type: ignore
 
 
 def test_c_cross_differs_from_old_factorised_form(rng, grid_inputs):
@@ -166,9 +166,9 @@ def test_c_cross_differs_from_old_factorised_form(rng, grid_inputs):
     )
 
     joint = blk.c_cross
-    assert not np.allclose(joint, factorised)
-    mask = np.abs(joint) > 1e-12
-    ratio = np.abs(factorised[mask] / joint[mask])
+    assert not np.allclose(joint, factorised) # type: ignore
+    mask = np.abs(joint) > 1e-12 # type: ignore
+    ratio = np.abs(factorised[mask] / joint[mask]) # type: ignore
     assert np.max(ratio) > 3.0, (
         "the factorised form should overestimate c_cross substantially"
     )
@@ -194,11 +194,11 @@ def test_c_cross_vanishes_when_d2_symmetric_part_used(rng, grid_inputs):
     blk = build_blocks(dy, sigma_grid, pshake_grid, k2, terms)
     # With a flat grid the contraction would cancel by antisymmetry; the
     # random grid breaks that, so the value must be non-zero and finite.
-    assert np.all(np.isfinite(blk.c_cross))
+    assert np.all(np.isfinite(blk.c_cross)) # type: ignore
     flat_sigma = np.ones_like(sigma_grid)
     flat_p = np.ones_like(pshake_grid)
     blk_flat = build_blocks(dy, flat_sigma, flat_p, k2, terms)
-    assert np.allclose(blk_flat.c_cross, 0.0, atol=1e-12)
+    assert np.allclose(blk_flat.c_cross, 0.0, atol=1e-12) # type: ignore
 
 
 def test_jj_branching_is_exactly_two(dyson, grid_inputs, all_terms):

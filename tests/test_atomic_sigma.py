@@ -142,7 +142,7 @@ def test_power_law_region_uses_requested_exponent():
     hv = np.array([2000.0, 4000.0])
     for exponent in (-3.0, HYDROGENIC_EXPONENT, -4.0):
         got = sigma("F", "1s", hv, high_energy_exponent=exponent)
-        slope = np.log(got[1] / got[0]) / np.log(hv[1] / hv[0])
+        slope = np.log(got[1] / got[0]) / np.log(hv[1] / hv[0]) # type: ignore
         assert slope == pytest.approx(exponent, rel=1e-12)
     # continuity at the last tabulated point, whatever the exponent
     hv_hi = 1500.0
@@ -161,7 +161,7 @@ def test_default_exponent_is_last_two_point_slope():
     want = (np.log(sg[-1] / sg[-2])) / (np.log(hv[-1] / hv[-2]))
     got_hv = np.array([1600.0, 3200.0])
     got = sigma("S", "2p", got_hv)
-    slope = np.log(got[1] / got[0]) / np.log(got_hv[1] / got_hv[0])
+    slope = np.log(got[1] / got[0]) / np.log(got_hv[1] / got_hv[0]) # type: ignore
     assert slope == pytest.approx(want, rel=1e-12)
 
 
@@ -192,7 +192,7 @@ def test_vectorisation_matches_scalar_calls():
 
 def test_shape_preserved_for_2d_input():
     hv = np.array([[700.0, 800.0], [900.0, 1000.0]])
-    assert sigma("F", "1s", hv).shape == (2, 2)
+    assert sigma("F", "1s", hv).shape == (2, 2) # type: ignore
 
 
 def test_s1s_entry_is_flagged_as_an_estimate():
@@ -214,7 +214,7 @@ class TestSigmaBuilder:
         builder = SigmaBuilder(basis)
         # Every AO of the default map is assigned; the map covers d
         # shells too, so nothing is unassigned in this layout.
-        assert builder.n_unassigned + builder.report()["n_assigned"] == 102
+        assert builder.n_unassigned + builder.report()["n_assigned"] == 102 # type: ignore
         assert set(builder.subshells_used) <= set(YEH_LINDAU)
         thr = builder.threshold_ev
         assigned = np.array([k is not None for k in builder.ao_keys])

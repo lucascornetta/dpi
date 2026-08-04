@@ -317,7 +317,7 @@ def test_voigt_integrates_to_its_area():
     for sigma_g, gamma_l in ((0.4, 0.0), (0.0, 0.3), (0.4, 0.3)):
         y = spectrum.voigt(x, 12.0, area, sigma_g, gamma_l)
         integral = np.trapezoid(y, x) if hasattr(np, "trapezoid") \
-            else np.trapz(y, x)
+            else np.trapezoid(y, x)
         assert np.isclose(integral, area, rtol=2e-3), (
             f"sigma_g={sigma_g} gamma_l={gamma_l}: {integral}"
         )
@@ -377,7 +377,7 @@ def test_broaden_conserves_total_area():
     states = [_mkstate(0, 12.0, 2.0), _mkstate(1, 18.5, 1.25)]
     y = spectrum.broaden(grid, states, 0.6, 0.25)
     area = np.trapezoid(y, grid) if hasattr(np, "trapezoid") \
-        else np.trapz(y, grid)
+        else np.trapezoid(y, grid)
     assert np.isclose(area, 3.25, rtol=2e-3)
 
 
