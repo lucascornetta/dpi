@@ -1,0 +1,221 @@
+#==============================================================================
+# dpi — input file for a double-photoionization CV spectrum
+#
+#   python dpi_run.py dpi_input.toml
+#
+# Every setting the calculation uses lives here; the driver takes no physics
+# flags.  Unrecognised keys are a hard error (with a spelling suggestion), so
+# a typo cannot silently fall back to a default.
+#
+# The example below is the SF6 S1s edge.  Values in < > must be edited.
+#==============================================================================
+
+[physics]
+
+# Photon energy of the measurement, eV.
+photon_energy_ev = 2610.0
+
+# Double ionization potential of the LOWEST dication state included in the
+# energy files, eV — the true energy gap E(M2+, lowest) - E(M, ground), from
+# your dSCF calculation.
+#
+# This is the physics.  Together with the dication energy list it fixes
+#     DIP_f    = true_dip_ev + (E_f - E_lowest)
+#     E_excess = photon_energy_ev - DIP_f
+# for every state.  It is NOT the same thing as output.display_onset_ev,
+# which only slides the x axis of the plot.  Getting these two confused
+# rescales every cross section in the run.
+true_dip_ev = 2511.0
+
+# Number of doubly occupied spatial MOs of the neutral molecule.
+# SF6 has 70 electrons, so 35.
+n_neu_occ = 35
+
+# "ls" — F1s and S1s edges.  Spin-orbit coupling in the core hole vanishes
+#        at first order, S_dic is a good quantum number, and each hole pair
+#        (i,j) gives one singlet and one triplet dication state.
+#        Channels: singlet, triplet.
+#
+# "jj"  — S2p edge.  The 1.2 eV spin-orbit splitting of the 2p core hole is
+#         comparable to the CV exchange splittings, so the core hole is
+#         labelled by j_C = 3/2, 1/2 with the valence hole and both
+#         photoelectrons as LS spectators.  Channels: jc32, jc12.
+#         The model then predicts a 2:1 intensity ratio and identical band
+#         shapes for the two peaks.
+coupling = "ls"
+
+# Gauss-Legendre points for the energy-sharing integral over eps_2.
+# The substitution eps_2 = E_excess * t^2 removes the k_2 -> 0 singularity;
+# 200 points is converged to well below the model's own accuracy.  The run
+# reports the residual between n_quad and 2*n_quad so you can check.
+n_quad = 200
+
+# Restrict the bound-to-bound dipole entering the indirect terms to
+# one-centre origin-shifted blocks (manuscript Eq. 117).  Keep this true:
+# the full molecular dipole carries a large R_A <chi_mu|chi_nu> positional
+# contribution that has no counterpart in the atomic cross sections, and it
+# makes the indirect terms dominate unphysically for delocalised valence MOs.
+one_centre_dipole = true
+
+# Also compute the frozen-orbital-limit reference spectrum, in which the
+# dication MOs are the neutral ones and the Dyson objects collapse to
+# Kronecker deltas.  Diagnostic: it isolates how much of the intensity comes
+# from orbital relaxation.  Requires [paths] frozen_energies.
+include_frozen = false
+
+# Power-law exponent for sigma^AO above the last tabulated Yeh-Lindau point.
+# Defaults to the slope of the final two tabulated points.  Override where
+# the extrapolation is long: the table stops at 1500 eV while the S1s edge is
+# probed at 2610 eV, and -3.5 is the hydrogenic value.  Worth sweeping
+# -3.0 / -3.5 / -4.0 to put an error bar on the S1s band intensities.
+high_energy_exponent = { S_1s = -3.5 }
+
+# Diagnostic override, normally absent.  The triplet amplitude already sums
+# the three M_S^dic substates coherently with their Clebsch-Gordan weights,
+# so an external (2S+1) = 3 double-counts.  See REVIEW.md [P-2].
+# spin_degeneracy_factor = 1.0
+
+
+[paths]
+
+# Common directory for everything in this section, factored out once.
+# TOML has no string concatenation -- `a = base + "x"` is a syntax error --
+# so this key does that job: set it, then write bare filenames below.
+# Absolute paths are left untouched, so a single entry can still point
+# outside the run directory (a shared .h5, say).  Omit it and every path is
+# taken as-is, relative to the directory you run dpi_run.py from.
+# NOTE cache_dir is an output location and is deliberately NOT prefixed.
+# root = "sf6/s1s"
+
+# Neutral RHF orbitals (INPORB / ScfOrb).
+neutral_orbitals = "scf.ScfOrb"
+
+# AO overlap matrix.  Simplest option is to point this at the same .h5 as
+# below: SEWARD already stores AO_OVERLAP_MATRIX there, so there is one less
+# file to keep in sync and it cannot disagree with the basis it describes.
+# A plain-text matrix is also accepted, lower-triangular or full square
+# (auto-detected); '#' and '*' lines are ignored.
+overlap = "scf.scf.h5"
+
+# OpenMolcas HDF5 from SEWARD/SCF.  Supplies the GTO primitives (for the
+# analytic shake-off probabilities), the AO dipole integrals (for the
+# indirect terms), the AO overlap, and the basis-function labels used to map
+# each AO onto an atomic subshell.  SEWARD must have computed multipole
+# integrals (MLTPole) or the indirect terms are unavailable.
+h5file = "scf.h5"
+
+# Relaxed OSRHF dication orbitals, one RasOrb per state, as a directory or a
+# glob.  Files are matched to energy-file lines by the state index embedded in
+# the filename, so ordering never depends on the shell's sort order.
+#
+# THE KEYS ARE ALWAYS singlet AND triplet, in BOTH coupling modes.  MOLCAS
+# never optimises orbitals for a j_C state: at the S 2p edge the j_C states
+# are a post-hoc recombination of the separately converged S_dic = 0 and
+# S_dic = 1 solutions.  So a jj run supplies the same two multiplicity
+# orbital sets as an ls run and only its `energies` carry the jc32/jc12
+# labels.  Each j_C peak is A(S=0) + A(S=1) and therefore needs BOTH sets;
+# the code refuses to proceed with only one.
+dication_orbitals = { singlet = "cv_singlets/", triplet = "cv_triplets/" }
+
+# Dication total energies, one value per line, in the unit set by
+# output.energies_unit.  Line N corresponds to state index N.
+#
+# UNLIKE the orbitals, these keys DO follow the coupling mode: for
+# coupling = "jj" write
+#   energies = { jc32 = "s2p_cv_jc32.dat", jc12 = "s2p_cv_jc12.dat" }
+# because the spin-orbit-resolved energies are genuinely different numbers,
+# whereas the orbital sets above are not.
+energies = { singlet = "s1s_cv_singlets.dat", triplet = "s1s_cv_triplets.dat" }
+
+# Frozen-orbital-limit dication energies, needed when include_frozen = true.
+# The frozen spectrum has its own energies; reusing the relaxed ones would
+# misplace every band.  All channels share one rigid shift so their relative
+# positions stay faithful to the frozen calculation.
+# frozen_energies = { singlet = "frozen_singlets.dat", triplet = "frozen_triplets.dat" }
+
+# Optional two-column (energy_eV, intensity) measured spectrum.  Only
+# dpi_plot.py reads it; it never enters the calculation.
+# experiment = "exp_s1s.dat"
+
+# Directory for the cached per-state Dyson objects (.npz).  Delete it to
+# force a recomputation.
+cache_dir = "dyson_cache"
+
+
+[output]
+
+directory = "out"
+spectrum  = "spectrum.dat"     # broadened spectrum, one column per channel
+sticks    = "sticks.dat"       # per-state intensities and term breakdown
+# latex_table = "states.tex"
+
+# Unit of the numbers in the energy files above: "au" (Hartree) or "ev".
+energies_unit = "au"
+
+# Cosmetic x-axis offset, eV: the lowest state is placed here and all others
+# keep their relative spacings.  Convenience for overlaying an experimental
+# binding-energy scale.  Affects the E_shifted_eV column and nothing else.
+display_onset_ev = 15.82
+
+# Spectrum grid.  Omit e_min_ev / e_max_ev to span the states plus a margin
+# of six times the larger Voigt width.
+# e_min_ev = 10.0
+# e_max_ev = 50.0
+e_step_ev = 0.02
+
+# Voigt line shape.  sigma is the Gaussian standard deviation (experimental
+# resolution and vibrational envelope); gamma is the Lorentzian HWHM
+# (core-hole lifetime).
+voigt_sigma_ev = 0.48
+voigt_gamma_ev = 0.23
+
+# Label used in output headers and as the default plot annotation.
+label = "CV states S1s"
+
+# States more than this far above the onset are omitted from the LaTeX table
+# (the .dat files always contain every state).
+max_table_ev = 40.0
+
+
+[terms]
+# Which contributions to the angle-averaged squared amplitude enter the
+# total.  Every term is reported per state in sticks.dat whether or not it
+# is included here, so one run tells you what changing a switch would do.
+#
+#   A(S=0) = 2(F_ij + F_ji) - 4 X_ij  [+ indirect]
+#   A(S=1) = [2(F_ij + F_ji) + 4 X_ij [+ indirect] + 4 G_ij - 4 C_ij] / 3
+#
+# with F_ij = D_i S_j (photoionization of hole i, shake-off of hole j),
+# X_ij = D_ij S_ij the cross-Dyson interference, G_ij the two-electron
+# alpha-alpha/beta-beta channel and C_ij its interference with the
+# one-electron amplitudes.
+
+# D_i S_j + D_j S_i.  The dominant CV mechanism; leave on.
+direct = true
+
+# -/+ 4 D_ij S_ij.  Suppressed by the near-orthogonality of core and valence
+# Dyson orbitals in the AO basis, but cheap, so it is computed rather than
+# assumed.  Check the reported values before claiming it is negligible.
+cross_dyson = true
+
+# B_i S_j + B_j S_i: shake-off driven by a bound-to-bound dipole transition
+# in the dication instead of direct photoemission.  Off by default, matching
+# the production model of the notes — but note that the manuscript's own
+# tables show these exceeding the direct terms for several states, which is
+# unresolved (REVIEW.md [P-4]).  Turn on to investigate; the values are
+# reported either way.
+indirect = false
+
+# +4 G_ij, the two-electron Dyson channel.  Open only to the triplet (and
+# hence to both j_C peaks), and not suppressed by the overlap determinant
+# for SF6 CV states, where |det(S_beta)| ~ 0.91-0.93.
+aa_bb = true
+
+# -4 C_ij, interference between the one- and two-electron Dyson amplitudes.
+c_cross = true
+
+# 2 X_f, the direct-indirect interference.  The model does not determine its
+# overall sign, so it is off by default; interference_sign makes the choice
+# explicit if you enable it.  Requires direct and indirect both on.
+dir_ind_interference = false
+# dir_ind_sign = 1
