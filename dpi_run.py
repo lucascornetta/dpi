@@ -84,9 +84,16 @@ class RunContext:
     terms: Any
     sigma_builder: SigmaBuilder
     basis: Any
+    omega_over_omega_eff: bool = False
+    """Whether to apply the per-AO ``omega/(eps1 + I_mu)`` weight, [A-8]."""
 
     def sigma_at_eps1_grid(self, eps1_ev: np.ndarray) -> np.ndarray:
-        return self.sigma_builder.at_eps1_grid(eps1_ev)
+        # omega is forwarded only when the [physics] omega_over_omega_eff
+        # switch is on; the builder then applies the per-AO
+        # omega/(eps1 + I_mu) weight of REVIEW.md [A-8].  Passing None
+        # reproduces the historical convention exactly.
+        omega = self.omega_ev if self.omega_over_omega_eff else None
+        return self.sigma_builder.at_eps1_grid(eps1_ev, omega_ev=omega)
 
     def p_shake_at_k(self, k_au: np.ndarray) -> np.ndarray:
         from dpi.shakeoff import p_shake
@@ -253,11 +260,21 @@ def dyson_for_orbitals(orbital_path: str, index: int, cfg: Config,
     """
     stem = os.path.splitext(os.path.basename(orbital_path))[0]
     cache = os.path.join(cfg.paths.cache_dir, f"{stem}_{index:04d}.npz")
+    # The cache is keyed by filename, so a file written by an earlier run
+    # with different SWITCHES is a name match but a content mismatch.  The
+    # signature records which optional blocks that run built; without it a
+    # stale cache either raises a confusing error deep in build_blocks
+    # (indirect terms, no lam_i) or -- worse -- silently omits the frozen
+    # block from the output.  See REVIEW.md [C-7].
+    want = "|".join((
+        f"lam={cfg.terms.indirect or cfg.terms.dir_ind_interference}",
+        f"frozen={cfg.physics.include_frozen}",
+    ))
     if os.path.isfile(cache):
         try:
-            return dyson.DysonObjects.load(cache)
+            return dyson.DysonObjects.load(cache, require=want)
         except Exception as exc:
-            log(f"    cache {cache} unreadable ({exc}); rebuilding")
+            log(f"    cache {cache} stale or unreadable ({exc}); rebuilding")
 
     dication = molcas_io.read_inporb(orbital_path)
     holes = molcas_io.rohf_hole_indices(dication.occ, cfg.physics.n_neu_occ)
@@ -337,15 +354,45 @@ def run(cfg: Config, log: Callable[[str], None]) -> dict[str, Any]:
         log(f"  AO dipole integrals read ({kind})")
 
     sigma_builder = SigmaBuilder(
-        basis, high_energy_exponents=cfg.physics.high_energy_exponent)
+        basis,
+        high_energy_exponents=cfg.physics.high_energy_exponent,
+        threshold_overrides=cfg.physics.threshold_override,
+        threshold_model=cfg.physics.threshold_model,
+        anchor_delta_ev=cfg.physics.anchor_delta_ev)
     assigned = getattr(sigma_builder, "n_assigned", None)
     if assigned is not None:
         log(f"  {assigned}/{nbas} AOs carry a tabulated atomic subshell; "
             f"the rest contribute zero cross section")
+    unsafe = getattr(sigma_builder, "unsafe_extrapolations", lambda: ())()
+    if unsafe:
+        # Two independent things make a near-threshold estimate untrustworthy,
+        # and they need different wording because the fix differs.  Name the
+        # reason per group rather than refuse: the affected subshells usually
+        # carry little intensity, so the run is still useful.
+        wide, disagree = [], []
+        for k in unsafe:
+            arm = sigma_builder.lever_arm(k)
+            if arm > 0.10:
+                wide.append(f"{k} (gap is {100 * arm:.0f}% of I_mu)")
+            else:
+                disagree.append(f"{k} (gap only {100 * arm:.1f}% of I_mu)")
+        model = cfg.physics.threshold_model
+        if wide:
+            log(f"  WARNING: threshold_model='{model}' extrapolates over a "
+                f"wide gap for {', '.join(wide)}; if the table starts past "
+                f"the subshell maximum this manufactures a rise the real "
+                f"curve does not have (REVIEW.md [A-14])")
+        if disagree:
+            log(f"  WARNING: 'coulomb' and 'extrapolate' disagree by >15% at "
+                f"threshold for {', '.join(disagree)} despite a short gap -- "
+                f"the tabulated curve is not locally power-law there (a "
+                f"delayed maximum at the edge), so neither estimate is "
+                f"reliable (REVIEW.md [A-16])")
 
-    context = RunContext(omega_ev=cfg.physics.photon_energy_ev,
-                         terms=cfg.terms, sigma_builder=sigma_builder,
-                         basis=basis)
+    context = RunContext(
+        omega_ev=cfg.physics.photon_energy_ev,
+        terms=cfg.terms, sigma_builder=sigma_builder, basis=basis,
+        omega_over_omega_eff=cfg.physics.omega_over_omega_eff)
 
     log("")
     log("pairing states with orbital files")
@@ -496,13 +543,20 @@ def write_outputs(cfg: Config,
 # ── synthetic demo ──────────────────────────────────────────────────────────
 
 def demo(directory: str, log: Callable[[str], None],
-         coupling: str = "ls") -> dict[str, Any]:
+         coupling: str = "ls",
+         overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     """Run the whole pipeline on a synthetic case, with no MOLCAS output.
 
     Exercises every module end to end: the readers, the Dyson algebra, the
     atomic tables, the shake-off transforms, the quadrature and the
     writers.  Useful as an installation check and as the fixture for the
     end-to-end test.
+
+    ``overrides`` are the parsed ``--set`` assignments, applied to the
+    generated input file exactly as they would be to a user's own.  Without
+    this, ``--demo`` silently ignored every ``--set`` on the command line,
+    which made the synthetic case useless for trying a switch out before
+    committing a real run to it.
     """
     os.makedirs(directory, exist_ok=True)
     case_dir = os.path.join(directory, "synthetic")
@@ -572,7 +626,7 @@ def demo(directory: str, log: Callable[[str], None],
         fh.write("\n".join(toml))
     log(f"demo input file: {toml_path}")
 
-    return run(load_config(toml_path), log)
+    return run(load_config(toml_path, overrides=overrides or {}), log)
 
 
 # ── command line ────────────────────────────────────────────────────────────
@@ -631,7 +685,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.demo:
-            demo(args.demo, log, coupling=args.demo_coupling)
+            demo_overrides = parse_set(args.set)
+            if args.output_dir:
+                demo_overrides["output.directory"] = args.output_dir
+            demo(args.demo, log, coupling=args.demo_coupling,
+                 overrides=demo_overrides)
             return 0
         if not args.input:
             build_parser().print_help()

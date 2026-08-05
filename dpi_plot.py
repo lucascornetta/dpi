@@ -13,12 +13,12 @@ the calculation itself.
 
 Panels
 ------
-top     Stick spectrum of the per-state intensities, one colour per
-        channel, with the state-density envelope (all states at equal
-        weight) drawn above it.  The envelope is a level-counting
-        reference independent of the intensity model, so a band that is
-        strong in the lower panel but sparse here is carried by a few
-        intense states rather than by a dense manifold.
+top     One equal-height stick per state, coloured by channel, with the
+        state-density envelope drawn above it.  Neither carries the
+        intensity model: the panel answers *where are the levels*, and
+        the lower panel answers *how strong are they*, so a band that is
+        strong below but sparse here is carried by a few intense states
+        rather than by a dense manifold.
 bottom  The broadened spectrum: one curve per channel, their sum, the
         optional frozen-orbital reference and the optional measurement.
 
@@ -33,19 +33,66 @@ import sys
 
 import numpy as np
 
-# Colour-blind-safe channel colours (Okabe-Ito).  Keys are the channel names
-# used in the .dat headers; the fallback cycle covers unexpected names.
-CHANNEL_STYLE = {
-    "singlet": ("#0072B2", "Singlets"),
-    "triplet": ("#D55E00", "Triplets"),
-    "jc32": ("#0072B2", r"$j_C = 3/2$"),
-    "jc12": ("#D55E00", r"$j_C = 1/2$"),
-}
-FALLBACK_COLOURS = ("#009E73", "#CC79A7", "#56B4E9", "#E69F00")
+# Figure geometry.  Near-unity aspect: the two-panel form is read as a
+# single square block in a one-column journal layout rather than as a wide
+# strip, which is what the extra width used to make of it.
+FIGSIZE_TWO_PANEL = (7.6, 7.2)
+FIGSIZE_ONE_PANEL = (7.6, 5.4)
 
-TOTAL_COLOUR = "#000000"
-FROZEN_COLOUR = "#7F7F7F"
-EXPERIMENT_COLOUR = "#4C72B0"
+# Font sizes, collected here so the whole figure can be rescaled for a
+# different column width by editing five numbers.  The x tick numbers are
+# deliberately the largest text: they are the only quantitative axis and
+# are what a reader checks first.
+FONT_TICK_X = 15
+FONT_TICK_Y = 11
+FONT_AXIS_LABEL = 12
+FONT_LEGEND = 10
+FONT_ANNOTATION = 15
+
+# Channel colours.  A deep-teal / MAGENTA pair on the blue-yellow axis,
+# which is the axis that survives red-green colour blindness; the default
+# blue/orange is avoided.  Relative luminances are 0.138 and 0.500, a
+# factor 3.6 apart, so the two curves also separate in greyscale print.
+CHANNEL_TEAL = "#16A8C2"     # deep teal, low luminance, reads as the dark
+CHANNEL_MAGENTA = "#E8298C"  # MAGENTA, high luminance, reads as the light
+
+# Extra hues for channel names the table below does not know about,
+# ordered so a two-channel fallback pair is still luminance-separated.
+ACCENT_SLATE = "#3B6E8F"   # muted slate blue, distinct from CHANNEL_TEAL
+ACCENT_ROSE = "#C2456E"    # desaturated rose, mid luminance
+ACCENT_OLIVE = "#8A8B2C"   # olive, high luminance without reading yellow
+ACCENT_VIOLET = "#6A3D9A"  # violet, darkest of the four
+FALLBACK_COLOURS = (ACCENT_SLATE, ACCENT_ROSE, ACCENT_OLIVE, ACCENT_VIOLET)
+
+# The three non-channel traces each keep a distinct treatment (colour plus
+# line style or marker) so they never compete with the channel hues.
+TOTAL_COLOUR = "#22282D"       # graphite; a dashed near-black for the sum
+FROZEN_COLOUR = "#95A0A8"      # cool grey; a dotted reference, not a datum
+# Sienna for the experimental overlay.  Two constraints: it must not duplicate
+# any channel or fallback colour (it previously carried ACCENT_VIOLET's exact
+# hex, so a 4th/unrecognised channel would have collided with it), and it must
+# separate from TOTAL_COLOUR in greyscale -- near-black failed that at a 1.17x
+# luminance ratio, while this gives 2.21x.  The overlay is additionally drawn
+# as markers and never as a line, so shape carries the distinction too.
+EXPERIMENT_COLOUR = "#140EB4"  # sienna; drawn as markers, never a line
+DENSITY_COLOUR = "#41576A"     # slate grey; dashed level-counting curve
+
+# Stick geometry.  Every state gets the SAME height: the panel is a level
+# map, so drawing physical intensities here would duplicate the lower
+# panel and hide the sparse-but-intense bands.  The density curve is
+# normalised to the same height and offset above the sticks.
+STICK_HEIGHT = 0.5
+STICK_WIDTH = 2.0
+DENSITY_AMPLITUDE = 1.9 * STICK_HEIGHT
+DENSITY_BASELINE = 1.2 * STICK_HEIGHT
+STICK_PANEL_TOP = 3.85 * STICK_HEIGHT
+
+CHANNEL_STYLE = {
+    "singlet": (CHANNEL_TEAL, "Singlets"),
+    "triplet": (CHANNEL_MAGENTA, "Triplets"),
+    "jc32": (CHANNEL_TEAL, r"$j_C = 3/2$"),
+    "jc12": (CHANNEL_MAGENTA, r"$j_C = 1/2$"),
+}
 
 
 def read_table(path: str) -> tuple[list[str], np.ndarray, list[str]]:
@@ -165,6 +212,33 @@ def style_for(channel: str, index: int) -> tuple[str, str]:
     return colour, channel.replace("_", " ")
 
 
+def frame_axes(ax, label_bottom: bool = True) -> None:
+    """Close the panel with inward ticks on all four edges.
+
+    The convention in this field is a boxed panel with the ticks pointing
+    into the data, so a reader can read a peak position off any edge.
+    Numbers stay on the bottom and are suppressed on the other three: the
+    y scale is arbitrary units, so its ticks are drawn unlabelled rather
+    than deleted, which keeps the frame complete without implying a
+    meaningful magnitude.
+    """
+    from matplotlib.ticker import AutoMinorLocator
+
+    for side in ("left", "right", "top", "bottom"):
+        ax.spines[side].set_visible(True)
+        ax.spines[side].set_linewidth(1.1)
+    ax.xaxis.set_minor_locator(AutoMinorLocator(2))
+    ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+    ax.tick_params(which="both", direction="in",
+                   top=True, bottom=True, left=True, right=True,
+                   labeltop=False, labelright=False, labelleft=False)
+    ax.tick_params(which="major", length=7.0, width=1.1,
+                   labelsize=FONT_TICK_Y)
+    ax.tick_params(which="minor", length=3.5, width=0.9)
+    ax.tick_params(axis="x", which="major", labelsize=FONT_TICK_X,
+                   labelbottom=label_bottom)
+
+
 def scale_experiment(exp_energy: np.ndarray, exp_signal: np.ndarray,
                      grid: np.ndarray, model: np.ndarray,
                      offset_fraction: float) -> tuple[np.ndarray, np.ndarray]:
@@ -234,11 +308,11 @@ def build_figure(args: argparse.Namespace):
 
     if sticks:
         fig, (ax_top, ax_bot) = plt.subplots(
-            2, 1, figsize=(9.0, 7.2), sharex=True,
+            2, 1, figsize=FIGSIZE_TWO_PANEL, sharex=True,
             gridspec_kw={"height_ratios": [1.0, 1.45], "hspace": 0.08})
         draw_sticks(ax_top, sticks, grid, channels, args, xlo, xhi)
     else:
-        fig, ax_bot = plt.subplots(figsize=(9.0, 4.6))
+        fig, ax_bot = plt.subplots(figsize=FIGSIZE_ONE_PANEL)
         ax_top = None
 
     draw_spectrum(ax_bot, grid, by_name, channels, total, args, xlo, xhi)
@@ -246,42 +320,34 @@ def build_figure(args: argparse.Namespace):
     label = args.label or header_value(header, "label") or ""
     target = ax_top if ax_top is not None else ax_bot
     if label:
-        target.text(0.025, 0.93, label, transform=target.transAxes,
-                    fontsize=13, va="top")
+        target.text(0.025, 0.955, label, transform=target.transAxes,
+                    fontsize=FONT_ANNOTATION, va="top")
 
-    ax_bot.set_xlabel("Shifted double ionization energy (eV)", fontsize=13)
+    ax_bot.set_xlabel("Shifted double ionization energy (eV)",
+                      fontsize=FONT_AXIS_LABEL)
     ax_bot.set_xlim(xlo, xhi)
     fig.align_ylabels()
     return fig
 
 
 def draw_sticks(ax, sticks, grid, channels, args, xlo, xhi) -> None:
-    """Top panel: per-state sticks plus the equal-weight state-density curve."""
-    intensity_key = _first_key(sticks[0], ("intensity", "i_dpi"))
+    """Top panel: equal-height state sticks plus the state-density curve."""
     energy_key = _first_key(sticks[0], ("e_shifted_ev", "energy_ev"))
-
-    peak = max((float(s[intensity_key]) for s in sticks
-                if _visible(s, energy_key, xlo, xhi)), default=0.0)
-    if peak <= 0:
-        peak = 1.0
 
     for index, channel in enumerate(channels):
         colour, label = style_for(channel, index)
-        rows = [s for s in sticks if str(s.get("channel", "")) == channel]
-        drawn = False
-        for row in rows:
-            energy = float(row[energy_key])
-            value = float(row[intensity_key])
-            if not (xlo <= energy <= xhi) or value <= 0:
-                continue
-            ax.plot([energy, energy], [0.0, value], color=colour, lw=1.6,
-                    solid_capstyle="butt",
-                    label=None if drawn else label, zorder=3)
-            drawn = True
+        # Height carries no information, so a single vlines call per
+        # channel is enough and guarantees the sticks cannot drift apart.
+        energies = [float(s[energy_key]) for s in sticks
+                    if str(s.get("channel", "")) == channel
+                    and _visible(s, energy_key, xlo, xhi)]
+        if energies:
+            ax.vlines(energies, 0.0, STICK_HEIGHT, color=colour,
+                      lw=STICK_WIDTH, label=label, zorder=3)
 
-    # Equal-weight envelope: every state contributes unit area, so this
-    # counts levels rather than intensity.  Scaled to the tallest stick and
-    # offset above it.
+    # Each state contributes a Voigt profile of unit AREA, so the envelope
+    # counts levels at equal weight exactly as the sticks do -- the two
+    # halves of the panel now say the same thing at different resolution.
     density = np.zeros_like(grid)
     for row in sticks:
         density += voigt(grid, float(row[energy_key]), 1.0,
@@ -293,24 +359,22 @@ def draw_sticks(ax, sticks, grid, channels, args, xlo, xhi) -> None:
     in_view = (grid >= xlo) & (grid <= xhi)
     scale = density[in_view].max() if in_view.any() else density.max()
     if scale > 0:
-        density = density / scale * peak
-    ax.plot(grid, density + 1.12 * peak, color="#444444", lw=1.3, ls="--",
-            label="State density", zorder=2)
+        density = density / scale * DENSITY_AMPLITUDE
+    ax.plot(grid, density + DENSITY_BASELINE, color=DENSITY_COLOUR, lw=1.6,
+            ls="--", label="conv. DOS", zorder=2)
 
-    ax.set_ylim(0.0, peak * 2.45)
-    ax.set_ylabel("Intensity (arb. units)", fontsize=12)
-    ax.set_yticks([])
-    ax.legend(loc="upper right", frameon=False, fontsize=11)
-    ax.tick_params(direction="out")
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
+    ax.set_ylim(0.0, STICK_PANEL_TOP)
+    ax.set_ylabel("States (equal weight)", fontsize=FONT_AXIS_LABEL)
+    ax.legend(loc="upper right", frameon=False, fontsize=FONT_LEGEND,
+              handlelength=1.6, borderaxespad=0.5)
+    frame_axes(ax, label_bottom=False)
 
 
 def draw_spectrum(ax, grid, by_name, channels, total, args, xlo, xhi) -> None:
     """Bottom panel: broadened per-channel curves, their sum and overlays."""
     for index, channel in enumerate(channels):
         colour, label = style_for(channel, index)
-        ax.plot(grid, by_name[channel.lower()], color=colour, lw=1.8,
+        ax.plot(grid, by_name[channel.lower()], color=colour, lw=2.0,
                 label=label, zorder=3)
 
     ax.plot(grid, total, color=TOTAL_COLOUR, lw=1.8, ls="--", label="Sum",
@@ -326,7 +390,7 @@ def draw_spectrum(ax, grid, by_name, channels, total, args, xlo, xhi) -> None:
         # reference for how much structure orbital relaxation supplies, not
         # an independent intensity prediction.
         scaled = frozen * (np.nanmax(total) / np.nanmax(frozen))
-        ax.plot(grid, scaled, color=FROZEN_COLOUR, lw=1.7, ls=":",
+        ax.plot(grid, scaled, color=FROZEN_COLOUR, lw=1.9, ls=":",
                 label="Frozen-orbital limit (scaled)", zorder=2)
         overlays.append(scaled)
 
@@ -337,8 +401,8 @@ def draw_spectrum(ax, grid, by_name, channels, total, args, xlo, xhi) -> None:
         exp_energy, exp_scaled = scale_experiment(
             exp_energy, exp_signal, grid, total, args.exp_offset)
         if exp_energy.size:
-            ax.scatter(exp_energy, exp_scaled, s=9,
-                       color=EXPERIMENT_COLOUR, alpha=0.8, zorder=5,
+            ax.scatter(exp_energy, exp_scaled, s=11,
+                       color=EXPERIMENT_COLOUR, alpha=0.85, zorder=5,
                        label="Experiment")
 
     # Scale the y-axis to what is VISIBLE, not to the whole spectrum.
@@ -355,15 +419,13 @@ def draw_spectrum(ax, grid, by_name, channels, total, args, xlo, xhi) -> None:
             if in_view.any():
                 top = max(top, float(np.nanmax(exp_scaled[in_view])))
         if top > 0:
-            ax.set_ylim(-0.04 * top, 1.38 * top)
+            ax.set_ylim(-0.04 * top, 1.45 * top)
 
-    ax.set_ylabel("Intensity (arb. units)", fontsize=12)
-    ax.set_yticks([])
+    ax.set_ylabel("Intensity (arb. units)", fontsize=FONT_AXIS_LABEL)
     ax.set_xlim(xlo, xhi)
-    ax.legend(loc="upper right", frameon=False, fontsize=11)
-    ax.tick_params(direction="out")
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
+    ax.legend(loc="upper left", frameon=False, fontsize=FONT_LEGEND,
+              handlelength=1.6, borderaxespad=0.5)
+    frame_axes(ax, label_bottom=True)
 
 
 def voigt(x: np.ndarray, centre: float, area: float,

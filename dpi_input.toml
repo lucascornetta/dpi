@@ -13,7 +13,7 @@
 [physics]
 
 # Photon energy of the measurement, eV.
-photon_energy_ev = 2610.0
+photon_energy_ev = 2599.0
 
 # Double ionization potential of the LOWEST dication state included in the
 # energy files, eV — the true energy gap E(M2+, lowest) - E(M, ground), from
@@ -51,11 +51,29 @@ coupling = "ls"
 n_quad = 200
 
 # Restrict the bound-to-bound dipole entering the indirect terms to
-# one-centre origin-shifted blocks (manuscript Eq. 117).  Keep this true:
+# one-centre origin-shifted blocks (notes Eq. 134).  Keep this true:
 # the full molecular dipole carries a large R_A <chi_mu|chi_nu> positional
 # contribution that has no counterpart in the atomic cross sections, and it
 # makes the indirect terms dominate unphysically for delocalised valence MOs.
 one_centre_dipole = true
+
+# Apply the residual omega / (eps1 + I_mu) weight to each AO's cross section.
+#
+# Substituting a TABULATED sigma^AO for the computed dipole matrix element
+# imports sigma's own normalisation.  Inverting its definition (notes Eq. 92)
+# cancels the sDCS prefactor's k_1, its k_2 and its 1/3 polarisation average
+# exactly -- but the prefactor carries the molecular photon energy while
+# sigma^AO is evaluated at the per-AO omega_eff = eps1 + I_mu, and that ratio
+# does not cancel.  See NORMALISATION.md for the derivation.
+#
+# Default false: every spectrum computed before this option existed omitted
+# the weight, so leaving it off reproduces earlier results exactly.  Note it
+# is NOT a rescaling in general -- omega_eff varies across the sharing
+# integral and differs between AOs (1.03-1.11 for F1s but 10.6-44.3 for F2p
+# at 770 eV), so for a core-VALENCE state it will change relative band
+# intensities.  Requires c_cross = false: C_ij carries the weight only to the
+# half power and the combination can drive A_f negative (REVIEW.md [A-8]).
+omega_over_omega_eff = true
 
 # Also compute the frozen-orbital-limit reference spectrum, in which the
 # dication MOs are the neutral ones and the Dyson objects collapse to
@@ -70,10 +88,88 @@ include_frozen = false
 # -3.0 / -3.5 / -4.0 to put an error bar on the S1s band intensities.
 high_energy_exponent = { S_1s = -3.5 }
 
+# Atomic ionization threshold I_mu per subshell, in eV.  Normally absent.
+#
+# I_mu is NOT taken from your MOLCAS files: by default it is the free-atom
+# threshold that ships with the Yeh-Lindau entry (F_2p 17.40, F_1s 692.30,
+# S_3p 10.40, S_1s 2472.00, ...).  That is the choice consistent with also
+# substituting a free-atom sigma, but it is an assumption, and I_mu is used
+# twice -- as the argument sigma_mu(eps1 + I_mu) and as the denominator of the
+# omega_over_omega_eff weight -- so an error in it does not cancel.
+#
+# Measured sensitivity at the F1s edge sits entirely on the CORE thresholds:
+# +2 eV on F_1s moves the singlet integral by 2.0%, on S_1s by 1.0%, while
+# every valence subshell is flat to under 0.15% (REVIEW.md [A-13]).  So this
+# override matters most for edges where a VALENCE AO carries dipole strength.
+#
+# Overriding moves only the point at which the curve is read; the tabulated
+# curve keeps its own free-atom onset.  Any override is echoed in the output
+# header, since a spectrum is not reproducible without it.
+# threshold_override = { F_2p = 15.7, S_3p = 12.0 }
+
+# Shape of sigma^AO between I_mu and the first tabulated point: "linear"
+# (default), "flat", "coulomb" or "wigner".  This gap is a MODEL, not data.
+# Note it lies ABOVE each threshold: sigma is read at hv = eps1 + I_mu with
+# eps1 >= 0, so nothing is ever evaluated below its own onset.  What
+# omega_over_omega_eff does is sample the gap more heavily (omega_eff -> I_mu
+# as eps1 -> 0); on the real F1s files the gap supplies 4.06% of the weighted
+# singlet intensity.  For F_1s and S_2s there is NO gap: their tabulations
+# include a point below the declared threshold, so the spline spans the onset.
+#
+#   coulomb  the exact hydrogenic (Stobbe) shape, rescaled to the tabulated
+#            magnitude.  PHYSICALLY CORRECT for tabulated atomic data: the
+#            residual ion is charged, so the Coulomb penetration factor
+#            cancels the phase-space suppression and sigma reaches a finite
+#            value at threshold.  The data agrees -- its first-two-point
+#            slopes are flat, not rising.
+#   flat     sigma held constant; the crude limit of coulomb, brackets it.
+#   wigner   (hv - I)^(l'+1/2).  Correct for a SHORT-RANGE final state, and
+#            therefore for this model's own plane-wave continuum -- but not
+#            for the tabulated sigma.  Kept to quantify that tension.
+#   linear   rises linearly from zero.  No final-state potential produces
+#            this; it is the default only so that spectra computed before
+#            this option existed still reproduce.
+#   anchored no assumed shape, but the physical boundary condition imposed.
+#            Drops every point at or below I_mu; inserts sigma = 0 exactly AT
+#            I_mu and a second knot at I_mu + anchor_delta_ev taken from
+#            extrapolating the cleaned data; interpolates the union with a
+#            shape-preserving PCHIP.  The only model that vanishes at
+#            threshold while inheriting its slope from the data.  Lands inside
+#            the flat/coulomb/extrapolate cluster (0.102% spread over all
+#            four), which is why it is worth having: a fourth, structurally
+#            different argument reaching the same answer.
+#   extrapolate
+#            no model at all: continue the log-log spline backwards.  Assumes
+#            only the data's own local shape, so where it agrees with coulomb
+#            (0.06% on the subshells carrying 94.6% of an F1s spectrum) the
+#            value is corroborated by two unrelated arguments.  Unbounded when
+#            abused -- on S_3p four standard interpolants spread over 7x -- so
+#            it is a CHECK, not a default.
+#
+# BEFORE trusting "coulomb", check the lever arm (hv_lo - I)/I: it is 0.003-0.004
+# for the core subshells but 0.61 for S_3p, whose table starts past its own
+# maximum.  The Stobbe shape is monotone falling, so extrapolating it back
+# through that peak manufactures a 3.6x rise the real curve lacks -- and that one
+# subshell, carrying 2.2% of the intensity, drives 59% of the raw correction.
+# Restricted to safe groups the correction is +2.7% (F1s) / +1.4% (S1s), not
+# +10.3%; quote those.  The driver warns by name when a group is over tolerance.
+# T/S is unaffected either way -- the branching comes from the Dyson algebra,
+# not sigma.  REVIEW.md [A-14].
+threshold_model = "anchored"
+
+# Width over which the "anchored" model climbs from zero at I_mu to the
+# extrapolated value, eV.  Ignored by every other threshold_model.  This is
+# physical content, not a tolerance: -> 0 makes the model a step, -> the gap
+# width makes it a rise across the whole gap.  Monotone and mild: the F1s-edge
+# ratio moves 1.02763 -> 1.02649 between delta = 0.001 and 0.1 (0.11% across
+# two epochs), and 1.01688 at 1.0.  Values > 1.0 eV are rejected (the
+# narrowest real gap, S_2s, is 0.8 eV).
+anchor_delta_ev = 0.1
+
 # Diagnostic override, normally absent.  The triplet amplitude already sums
 # the three M_S^dic substates coherently with their Clebsch-Gordan weights,
 # so an external (2S+1) = 3 double-counts.  See REVIEW.md [P-2].
-# spin_degeneracy_factor = 1.0
+## spin_degeneracy_factor = 1.0
 
 
 [paths]
@@ -85,7 +181,7 @@ high_energy_exponent = { S_1s = -3.5 }
 # outside the run directory (a shared .h5, say).  Omit it and every path is
 # taken as-is, relative to the directory you run dpi_run.py from.
 # NOTE cache_dir is an output location and is deliberately NOT prefixed.
-# root = "sf6/s1s"
+root = "sf6/s1s"
 
 # Neutral RHF orbitals (INPORB / ScfOrb).
 neutral_orbitals = "scf.ScfOrb"
@@ -102,7 +198,7 @@ overlap = "scf.scf.h5"
 # indirect terms), the AO overlap, and the basis-function labels used to map
 # each AO onto an atomic subshell.  SEWARD must have computed multipole
 # integrals (MLTPole) or the indirect terms are unavailable.
-h5file = "scf.h5"
+h5file = "scf.scf.h5"
 
 # Relaxed OSRHF dication orbitals, one RasOrb per state, as a directory or a
 # glob.  Files are matched to energy-file lines by the state index embedded in
@@ -131,11 +227,11 @@ energies = { singlet = "s1s_cv_singlets.dat", triplet = "s1s_cv_triplets.dat" }
 # The frozen spectrum has its own energies; reusing the relaxed ones would
 # misplace every band.  All channels share one rigid shift so their relative
 # positions stay faithful to the frozen calculation.
-# frozen_energies = { singlet = "frozen_singlets.dat", triplet = "frozen_triplets.dat" }
+## frozen_energies = { singlet = "frozen_singlets.dat", triplet = "frozen_triplets.dat" }
 
 # Optional two-column (energy_eV, intensity) measured spectrum.  Only
 # dpi_plot.py reads it; it never enters the calculation.
-# experiment = "exp_s1s.dat"
+## experiment = "exp_s1s.dat"
 
 # Directory for the cached per-state Dyson objects (.npz).  Delete it to
 # force a recomputation.
@@ -204,7 +300,7 @@ cross_dyson = true
 # tables show these exceeding the direct terms for several states, which is
 # unresolved (REVIEW.md [P-4]).  Turn on to investigate; the values are
 # reported either way.
-indirect = false
+indirect = true
 
 # +4 G_ij, the two-electron Dyson channel.  Open only to the triplet (and
 # hence to both j_C peaks), and not suppressed by the overlap determinant
@@ -212,7 +308,7 @@ indirect = false
 aa_bb = true
 
 # -4 C_ij, interference between the one- and two-electron Dyson amplitudes.
-c_cross = true
+c_cross = false
 
 # 2 X_f, the direct-indirect interference.  The model does not determine its
 # overall sign, so it is off by default; interference_sign makes the choice
