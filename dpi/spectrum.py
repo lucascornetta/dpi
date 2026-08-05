@@ -1,5 +1,7 @@
 """Energy-sharing quadrature and Voigt broadening.
 
+Equation numbers refer to **dpi_notes_revised.tex** (the 47-page
+revision; the earlier manuscript numbering differs).
 The singly-differential DPI intensity of a core-valence state ``f`` is
 integrated over the sharing of the excess energy between the two emitted
 electrons,
@@ -233,24 +235,56 @@ def prefactor(omega_ev: float) -> float:
     Notes
     -----
     The output of this package is a **relative** DPI intensity carrying the
-    mixed unit Mb*a.u., not an absolute cross section in Mb.  The
-    ``4*pi^2*omega/(3c)`` and ``k1*k2`` phase-space prefactors of Eq. (78)
-    cancel against factors already implicit in the definitions of
-    ``sigma^AO_mu`` (Eq. 81) and ``k2*P_nu`` (Eq. 92).  Recovering an
-    absolute cross section additionally requires three convention
-    inconsistencies in the notes to be resolved (REVIEW.md [P-6]):
+    mixed unit Mb*a.u., not an absolute cross section in Mb.
+
+    The ``4*pi^2*omega/(3c) * k1 * k2`` prefactor of Eq. (89) cancels
+    almost entirely, but the cancellation is *not* complete and the earliest
+    version of this docstring overstated it.  Substituting a **tabulated**
+    ``sigma^AO`` for the computed dipole matrix element imports sigma's own
+    normalisation; inverting its definition, Eq. (93), via
+    Eq. (99) gives
+
+        INT dOmega_k1 sum_alpha |<psi_k1|r_alpha|chi_mu>|^2
+            = sigma_mu(w_eff) * 3c / (4 pi^2 w_eff k_1)
+
+    so that, term by term:
+
+    * ``k_1`` cancels against the ``1/k_1`` above -- this is why
+      Eq. (93) must carry its explicit ``k``, and why
+      Eq. (99) is written as its exact algebraic inverse;
+    * the ``1/3`` polarisation average cancels, appearing once in
+      Eq. (89) and once inside ``sigma^AO``.  Note that the operator
+      inside Eq. (93) is the **Cartesian sum**
+      ``sum_alpha |<psi|r_alpha|chi>|^2``, not ``|<psi|eps.r|chi>|^2``:
+      the ``1/3`` *is* the average over ``eps``, Eq. (94),
+      so carrying both would count it twice and lose a factor 3
+      (Remark 3);
+    * ``k_2`` cancels because the explicit ``k2`` of the shake-off block,
+      ``S_i = sum_nu (d^nu)^2 k2 Pbar_nu``, *is* electron 2's phase-space
+      factor -- the bare angular integral of the overlap leg is ``Pbar_nu``
+      alone;
+    * ``omega / w_eff`` does **not** cancel: the prefactor carries the
+      molecular ``omega`` while sigma carries the per-AO
+      ``w_eff = eps1 + I_mu``.
+
+    That residual ratio is a *function* of the integration variable, so it
+    cannot live in this scalar hook; it is applied per AO inside
+    :meth:`dpi.atomic_sigma.SigmaBuilder.at_eps1_grid` when
+    ``[physics] omega_over_omega_eff = true``.  It is off by default because
+    every spectrum computed before it existed omitted it.  See REVIEW.md
+    [A-8] for the measured effect (a factor ~0.69 on SF6 F1s intensities,
+    and a large reweighting of valence-dominated AOs).
+
+    Recovering a genuinely absolute cross section still requires two
+    convention inconsistencies to be resolved (REVIEW.md [P-6]):
 
     * the ``(2*pi)^-3`` normalisation of ``P^shake`` and its ``dOmega_k``
       integral-versus-average reading ([B-2]);
-    * the factor-3 disagreement between Eqs. (113) and (116) in the weight
-      of ``G_ij`` ([P-1]);
-    * dimensional reconciliation of ``sigma^AO_mu`` in Mb against
-      ``k2*P_nu`` in atomic units.
+    * the factor-3 disagreement between Eqs. (130) and
+      (141) in the weight of ``G_ij`` ([P-1]).
 
     Until those are settled, returning anything other than ``1.0`` here
-    would attach a spurious absolute scale to a relative spectrum.  Ratios
-    between states, channels and photon energies are unaffected, which is
-    where the model's predictive content lies.
+    would attach a spurious absolute scale to a relative spectrum.
     """
     if not np.isfinite(omega_ev):
         raise ModelError(

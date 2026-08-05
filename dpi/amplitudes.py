@@ -1,4 +1,4 @@
-"""Gelius-model building blocks and spin-recoupled squared DPI amplitudes.
+"""DPÌ-model building blocks and spin-recoupled squared DPI amplitudes.
 
 This module is the physics-assembly layer.  It reads no files and computes
 no Dyson orbitals: it consumes the arrays produced by :mod:`dpi.dyson`,
@@ -6,16 +6,18 @@ no Dyson orbitals: it consumes the arrays produced by :mod:`dpi.dyson`,
 amplitude ``A_f`` of the singly-differential DPI cross section on the whole
 energy-sharing quadrature grid at once.
 
-Notation follows SPEC.md section 6, which renames the manuscript's
-overloaded symbols::
+Equation numbers throughout this module refer to **dpi_notes_revised.tex**
+(the 47-page revision, not the earlier manuscript, whose numbering differs
+because the i=j sections were inserted).  Notation follows SPEC.md
+section 6, which renames the notes' overloaded symbols::
 
-    absorb_i    D_i     Eq. 89     photoabsorption block of hole i
-    shake_i     S_i     Eq. 92     shake-off block of hole i
-    indirect_i  B_i     Eq. 96     indirect (bound-bound dipole) block
-    absorb_ij   D_ij    Eq. 98     cross-Dyson photoabsorption bilinear
-    shake_ij    S_ij    Eq. 99     cross-Dyson shake-off bilinear
-    g_aa        G_ij    Eq. 112    alpha-alpha / beta-beta two-continuum term
-    c_cross     C_ij    Eq. 114    one-electron / two-electron interference
+    absorb_i    D_i     Eq. 103     photoabsorption block of hole i
+    shake_i     S_i     Eq. 106     shake-off block of hole i
+    indirect_i  B_i     Eq. 110     indirect (bound-bound dipole) block
+    absorb_ij   D_ij    Eq. 112     cross-Dyson photoabsorption bilinear
+    shake_ij    S_ij    Eq. 113     cross-Dyson shake-off bilinear
+    g_aa        G_ij    Eq. 130    alpha-alpha / beta-beta two-continuum term
+    c_cross     C_ij    Eq. 142    one-electron / two-electron interference
 
 Units.  ``sigma_grid`` is in Mb (never converted, see SPEC.md section 1),
 ``pshake_grid`` and ``k2`` are in atomic units, and every block and
@@ -82,7 +84,7 @@ class TermSwitches:
     separately switchable *and* separately reported by
     :func:`term_breakdown`, so the open question of REVIEW.md [P-4] --
     whether the indirect terms really are negligible once the one-centre
-    dipole of Eq. (117) is used -- can be settled from a single run rather
+    dipole of Eq. (146) is used -- can be settled from a single run rather
     than argued from Table 3.
 
     Attributes
@@ -98,10 +100,19 @@ class TermSwitches:
         Include ``+4*g_aa`` in the triplet.
     dir_ind_interference:
         Include the direct/indirect mechanism interference ``X_f``
-        (manuscript Eqs. 104, 110).  Off by default because its relative
-        sign is undetermined; when switched on the sign is taken from
-        ``dir_ind_sign`` so that it is an explicit choice and never an
-        accident of implementation.
+        (notes Eqs. (121) and (128)).  Off by
+        default, and the reason is now stronger than the caution this knob
+        was built for: Remark 6 of the notes proves
+        ``X_f == 0`` identically in the one-centre approximation, Eq.
+        (122).  Every one of the sixteen monomials of
+        ``2 Re[A_dir A_ind*]`` puts one dipole leg and one overlap-type leg
+        on the same electron, which the parity selection rule
+        Eq. (148) kills AO-diagonally.  So no
+        undetermined sign enters the model at any point, and switching this
+        on only probes the *inter*-AO terms that Eq. (98)
+        discards -- which this implementation does not compute.  ``dir_ind_sign``
+        therefore selects the sign of a term that should evaluate to zero;
+        a non-zero result is a bug report, not a physical contribution.
     c_cross:
         Include ``-4*c_cross`` in the triplet.
     dir_ind_sign:
@@ -109,7 +120,7 @@ class TermSwitches:
         ``-1.0``; only consulted when ``dir_ind_interference`` is on.
     spin_degeneracy_factor:
         Diagnostic multiplier on ``A(S=1)``.  **Physics default 1.0.**  No
-        ``(2S+1)`` factor belongs here: Eq. (75) already sums the three
+        ``(2S+1)`` factor belongs here: Eq. (86) already sums the three
         ``M_S^dic`` substates coherently with their Clebsch-Gordan
         weights, and ``1 (x) 1`` contains exactly one ``S_tot = 0``
         state, so a further factor 3 double-counts (ruling [P-2]).  The
@@ -279,15 +290,60 @@ def build_blocks(
     -----
     Implemented equations, with ``w = k2 * P^shake`` the shake-off weight::
 
-        absorb_i  = sum_mu (d_i^mu)^2 sigma_mu           (Eq. 89)
-        shake_i   = sum_nu (d_i^nu)^2 w_nu               (Eq. 92)
-        indirect_i= sum_nu (Lam_i^nu)^2 w_nu             (Eq. 96)
-        absorb_ij = sum_mu d_i^mu d_j^mu sigma_mu        (Eq. 98)
-        shake_ij  = sum_nu d_i^nu d_j^nu w_nu            (Eq. 99)
+        absorb_i  = sum_mu (d_i^mu)^2 sigma_mu           (Eq. 103)
+        shake_i   = sum_nu (d_i^nu)^2 w_nu               (Eq. 106)
+        indirect_i= sum_nu (Lam_i^nu)^2 w_nu             (Eq. 110)
+        absorb_ij = sum_mu d_i^mu d_j^mu sigma_mu        (Eq. 112)
+        shake_ij  = sum_nu d_i^nu d_j^nu w_nu            (Eq. 113)
         g_aa      = det_sb^2 sum_{mu,nu} (D_ij^{mu,nu})^2 sigma_mu w_nu
         c_cross   = det_sb [ (sqrt(sigma) o d_i) D_ij (d_j o sqrt(w))
-                             + (i<->j) ]                   (Eq. 114, made
+                             + (i<->j) ]                   (Eq. 142, made
                                                             gauge covariant)
+
+    ``g_aa`` is not an independent integral.  All three Dyson objects are
+    minors of the *same* n x n overlap matrix ``Q[p,q] = <phi^dic_p|phi^neu_q>``
+    -- ``d_i`` deletes row i, ``d_j`` deletes row j, ``d2_ij`` deletes both,
+    and ``det_sb = det(Q)`` deletes nothing (verified: ``det(Q)`` and
+    ``det_sb`` agree to a ratio of ``1.0000000000`` on the real SF6 F1s CV
+    state).  Minors of one matrix are not independent, and Jacobi's identity
+    on complementary minors, notes Eq. (132), pins them:
+
+        det_sb * d2_ij = -(d_i (x) d_j - d_j (x) d_i)
+
+    which is notes Eq. (134) in the AO basis
+    (Eq. (133) in the MO basis).  Verified to a relative
+    ``9e-16`` over all 35x35 index pairs on the real state and to ``<2e-15``
+    for random non-orthogonal sets at ``n = 5,8,12,20,35``
+    (``tests/test_dyson.py``).
+
+    Substituting it cancels ``det_sb^2`` and expands the square --- notes
+    Eqs. (135) to (138) --- giving
+    Eq. (131):
+
+        g_aa == absorb_i*shake_j + absorb_j*shake_i - 2*absorb_ij*shake_ij
+             == F_ij + F_ji - 2 D_ij S_ij
+
+    to ``1e-14``.  So ``aa_bb`` changes the *coefficients* of blocks the
+    model already has, not the information content: with ``aa_bb`` and
+    ``cross_dyson`` both on, the triplet's spin-summed content collapses to
+    ``6(F_ij + F_ji) - 4 D_ij S_ij``, notes Eq. (139).
+    Computing it from ``d2_ij`` is still a valid and well-conditioned route;
+    it simply cannot disagree, and a disagreement is a bug.
+
+    Two consequences worth stating.  First, the note-#2 argument that
+    ``G_ij`` is "not negligibly suppressed" because
+    ``|det(S_beta)| ~ 0.91-0.93`` is beside the point: ``det_sb`` cancels
+    identically, so ``G_ij``'s size is set by ``F_ij + F_ji`` and by how
+    nearly parallel ``d_i`` and ``d_j`` are, not by the overlap determinant.
+    (The argument does still hold for ``c_cross``, which is *linear* in
+    ``det_sb`` with no cancellation.)  Second, on the real F1s CV state
+    ``D_ij S_ij ~ 4.9e-11`` while ``F_ij + F_ji = 8.48795973e-2``, so
+    ``g_aa`` equals the triplet direct term to eight digits -- which is why
+    the measured breakdown shows ``aa_bb`` at exactly ``2.00000000x`` the
+    triplet ``direct`` entry, notes Eq. (140).  That is
+    the identity, not a bug, and any departure from 2 measures
+    ``D_ij S_ij`` -- the AO-basis non-orthogonality of the two Dyson
+    orbitals -- and nothing else.
 
     ``g_aa`` uses the *diagonal* form of note #2, ruling [P-3]: only the
     diagonal form is consistent with the one-centre approximation used
@@ -331,7 +387,7 @@ def build_blocks(
             "guarantees k2 >= 0."
         )
 
-    # w_nu(eps2) = k2 * P^shake_nu(k2).  Eq. (83) normalises the integral
+    # w_nu(eps2) = k2 * P^shake_nu(k2).  Eq. (96) normalises the integral
     # of this weight to one, so it is non-negative by construction; a
     # negative entry means the shake-off module produced an unphysical
     # density and must not be silently square-rooted.
@@ -408,21 +464,21 @@ def build_blocks(
             "dyson.d2_ij / dyson.det_sb is None; two_electron_amplitudes_ij "
             "and det_s_beta must be evaluated for this state."
         )
-    if need_two_electron and det_sb is not None:
+    if need_two_electron:
         d2 = np.asarray(d2_ij, dtype=float)
         if d2.shape != (nbas, nbas):
             raise ModelError(
                 f"amplitudes.build_blocks: dyson.d2_ij has shape "
                 f"{d2.shape}, expected ({nbas}, {nbas})."
             )
-        det_sb = float(det_sb)
+        det_sb = float(det_sb) # type: ignore
         if terms.aa_bb:
             # sigma_q . (d2**2) . w_q at every grid point q at once.
             blk.g_aa = det_sb**2 * np.einsum(
                 "qm,mn,qn->q", sigma_grid, d2 * d2, w, optimize=True
             )
         if terms.c_cross:
-            # Gauge-covariant form.  Manuscript Eq. (114) reads
+            # Gauge-covariant form.  Notes Eq. (142) reads
             #
             #   C_ij = det_sb sum_{mu,nu} D_ij^{mu,nu} d_i^mu
             #          [sigma_mu k2 P_nu]^(1/2)  +  (i<->j)
@@ -433,7 +489,7 @@ def build_blocks(
             # any orbital in that set is rephased phi_p -> -phi_p, an
             # unphysical operation that no observable may see.  Measured on
             # a 6-orbital test case: F and G are invariant to 1e-12 under
-            # all such flips, while the Eq. (114) expression returns -1.0000
+            # all such flips, while the Eq. (142) expression returns -1.0000
             # times its value for a flip of a doubly occupied orbital and
             # 0.6361 for a flip of a singly occupied one -- not even a sign,
             # because its two summands transform differently.  The term
@@ -477,7 +533,7 @@ def _ls_breakdown(
         overall = 1.0
     elif spin == "triplet":
         # The triplet is symmetric under 1<->2 so its cross terms add; the
-        # 1/3 is the Clebsch-Gordan weight of Eq. (116) (ruling [P-1]).
+        # 1/3 is the Clebsch-Gordan weight of Eq. (86) (ruling [P-1]).
         cross_sign = +1.0
         overall = terms.spin_degeneracy_factor / 3.0
     else:
@@ -505,9 +561,14 @@ def _ls_breakdown(
     if terms.dir_ind_interference:
         m_i = _require("mixed_i", blk.mixed_i, "dir_ind_interference")
         m_j = _require("mixed_j", blk.mixed_j, "dir_ind_interference")
-        # X_f, manuscript Eqs. (104) and (110).  The relative sign is not
-        # fixed by the isotropic average (see build_blocks), so it is taken
-        # from the explicit switch rather than from operator ordering.
+        # X_f, notes Eqs. (121) and (128).  Remark
+        # 6 proves X_f == 0 identically in the one-centre
+        # approximation, Eq. (122): every monomial of
+        # 2 Re[A_dir A_ind*] carries one dipole and one overlap leg on the
+        # same electron, which Eq. (148) kills
+        # AO-diagonally.  The sign switch therefore selects the sign of a
+        # vanishing quantity; a non-zero value here means an AO-diagonal
+        # leg survived that should not have.
         out["dir_ind_interference"] = (
             terms.dir_ind_sign * 2.0
             * (m_i * blk.shake_j + m_j * blk.shake_i)
@@ -637,7 +698,7 @@ def amplitude_ls(blk: Blocks, spin: str, terms: TermSwitches) -> np.ndarray:
       contraction of the antisymmetric ``d2_ij`` with no positivity
       bound, and it grows linearly in ``d2_ij`` while the direct term does
       not depend on it at all.  This is the regime in which the
-      one-centre truncation of Eq. (114) fails, and it is exactly what a
+      one-centre truncation of Eq. (142) fails, and it is exactly what a
       reported negative intensity is for.
     * ``A(S=0)`` can also go negative once ``dir_ind_interference`` is
       enabled, since the sign of ``X_f`` is a free choice.

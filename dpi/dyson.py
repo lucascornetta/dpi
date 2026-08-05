@@ -1,5 +1,7 @@
 """Dyson amplitudes between a closed-shell neutral and a relaxed dication.
 
+Equation numbers refer to **dpi_notes_revised.tex** (the 47-page
+revision; the earlier manuscript numbering differs).
 The neutral is RHF with ``n`` doubly occupied spatial orbitals
 ``phi^neu_q``; the core-valence dication is OSRHF with its **own** relaxed
 set ``phi^dic_k``.  The two sets are not orthogonal,
@@ -65,7 +67,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -603,7 +605,7 @@ def lambda_coefficients(
     n_neu_occ: int,
     dipole_ao: Mapping[str, np.ndarray],
 ) -> np.ndarray:
-    """Indirect Dyson coefficients ``lam_i`` in the AO basis (Eq. 95).
+    """Indirect Dyson coefficients ``lam_i`` in the AO basis (Eq. 109).
 
     Parameters
     ----------
@@ -658,14 +660,24 @@ def lambda_coefficients(
     handed to :func:`cofactor_vector` as a single batch, so the whole
     family costs one batched SVD and one batched determinant.
 
-    Caution.  The manuscript's Eq. (95) was available to this
-    implementation only through its description, not verbatim.  The
-    structure above is the unique one-body generalized Slater-Condon
-    result for this matrix element and reproduces the brute-force
-    row-replacement sum exactly (see ``tests/test_dyson.py``), but the
-    placement of the dipole indices should be confirmed against the
-    equation before the indirect terms are switched on for production --
-    they are off by default (REVIEW.md [P-4]).
+    Verified against the notes.  An earlier version of this docstring
+    cautioned that the placement of the dipole indices had not been checked
+    against the equation, only against a brute-force row-replacement sum.
+    It has now been checked directly.  Building ``S_i^alpha`` explicitly as
+    ``Q_a`` with the continuum row appended and evaluating the signed
+    cofactors ``C_pq(S_i^alpha)`` of notes Eq. (54) by
+    explicit determinants -- i.e. the chain
+    Eq. (55) -> Eq. (56) -> Eq. (108)
+    that defines ``Lambda_i^nu`` in Eq. (109) -- reproduces
+    this function to a relative ``2e-15`` with a fitted scale of
+    ``1.0000000000`` on a random 6-occupied/8-AO case.  The index placement
+    is therefore correct as implemented.
+
+    Two caveats survive, neither about this function's algebra.  The dipole
+    matrix elements fed in should be the one-centre restricted ones of
+    Eq. (146) for consistency with the Gelius reduction
+    (``[physics] one_centre_dipole``), and the indirect terms remain off by
+    default pending the magnitude question of REVIEW.md [P-4].
     """
     Q_a = np.asarray(Q_a, dtype=float)
     C_neu = np.asarray(C_neu, dtype=float)
@@ -852,9 +864,33 @@ class DysonObjects:
         out[prefix + "meta_json"] = np.array(
             json.dumps(self.meta, sort_keys=True, default=str)
         )
+        if not prefix:
+            out["cache_signature"] = np.array(self.cache_signature())
         if self.frozen is not None:
             out.update(self.frozen._flatten(prefix + "frozen_"))
         return out
+
+    def cache_signature(self) -> str:
+        """What this state was *built with*, for cache invalidation.
+
+        The cached ``.npz`` records the arrays that exist, not the switches
+        that decided whether to compute them.  Reusing a cache built with
+        ``dipole_ao=None`` under ``terms.indirect = true`` therefore yields
+        a state whose ``lam_i`` is ``None`` for no visible reason -- the
+        input file says the term is on, and the error names a function the
+        user never called.  Worse, a cache built with
+        ``include_frozen = false`` leaves ``frozen`` as ``None``, which the
+        driver silently *skips* rather than reporting: a quiet missing
+        block in the output.
+
+        Both are the same defect -- a cache keyed on the orbital filename
+        alone -- so both are fixed by storing this signature and comparing
+        it on load.
+        """
+        return "|".join((
+            f"lam={self.lam_i is not None}",
+            f"frozen={self.frozen is not None}",
+        ))
 
     def save(self, path: str | os.PathLike) -> str:
         """Write the state to a single compressed ``.npz``.
@@ -881,7 +917,7 @@ class DysonObjects:
         p = os.fspath(path)
         if not p.endswith(".npz"):
             p += ".npz"
-        np.savez_compressed(p, **self._flatten()) # type: ignore
+        np.savez_compressed(p, **self._flatten())
         return p
 
     @classmethod
@@ -905,11 +941,33 @@ class DysonObjects:
         return cls(**kw)
 
     @classmethod
-    def load(cls, path: str | os.PathLike) -> "DysonObjects":
-        """Read a state written by :meth:`save`."""
+    def load(cls, path: str | os.PathLike,
+             require: str | None = None) -> "DysonObjects":
+        """Read a state written by :meth:`save`.
+
+        Parameters
+        ----------
+        path : str or path-like
+        require : str, optional
+            A :meth:`cache_signature` the file must match.  When given and
+            the stored signature differs, :class:`ModelError` is raised
+            naming both, so the caller can rebuild rather than proceed with
+            a state missing the very arrays the run needs.  Files written
+            before signatures existed carry none and are treated as
+            mismatched, which errs toward rebuilding.
+        """
         with np.load(os.fspath(path), allow_pickle=False) as fh:
             data = {k: fh[k] for k in fh.files}
-        return cls._unflatten(data)
+        obj = cls._unflatten(data)
+        if require is not None:
+            got = (str(np.asarray(data["cache_signature"]).reshape(())[()])
+                   if "cache_signature" in data else "<unsigned>")
+            if got != require:
+                raise ModelError(
+                    f"cached state was built with [{got}] but this run "
+                    f"needs [{require}]"
+                )
+        return obj
 
 
 # ── frozen-orbital limit ────────────────────────────────────────────────────
@@ -974,8 +1032,8 @@ def frozen_objects(
     mixed inside one expression.
 
     This limit is a diagnostic, not a vanishing baseline.  The bullet
-    under manuscript Eq. (116) claims the two-electron and indirect
-    blocks all vanish here; they do not (REVIEW.md [P-5]).  ``D_ij`` and
+    under notes Eq. (145) claims the two-electron and
+    indirect blocks all vanish here; they do not (REVIEW.md [P-5]).  ``D_ij`` and
     ``S_ij`` survive because two distinct MOs share AO support, ``G_ij``
     is manifestly non-zero, and the indirect term survives because the
     dipole between two occupied orbitals is non-zero.  The underlying

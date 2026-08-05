@@ -1,5 +1,7 @@
 """Tabulated atomic subshell photoionization cross sections, in Mb.
 
+Equation numbers refer to **dpi_notes_revised.tex** (the 47-page
+revision; the earlier manuscript numbering differs).
 The Gelius one-centre intensity model weights each AO :math:`\\chi_\\mu` by
 the photoionization cross section of the free-atom subshell that AO
 represents.  This module holds that table for the elements of SF6 and
@@ -44,11 +46,11 @@ in Mb.  No conversion to :math:`a_0^2` is applied anywhere.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 import numpy as np
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import CubicSpline, PchipInterpolator
 
 from .constants import ConfigError, ModelError
 
@@ -59,6 +61,8 @@ __all__ = [
     "HYDROGENIC_EXPONENT",
     "REGION_BELOW_THRESHOLD",
     "REGION_LINEAR_RISE",
+    "REGION_NEAR_THRESHOLD",
+    "THRESHOLD_MODELS",
     "REGION_TABULATED",
     "REGION_POWER_LAW",
     "sigma",
@@ -78,12 +82,82 @@ _HYDROGENIC_NOTE = (
 )
 
 # Region codes returned by sigma_region().  The driver reports whether any
-# evaluation fell in REGION_LINEAR_RISE, because that region is a stopgap
-# (see _rise_region below) rather than tabulated data.
+# evaluation fell in the near-threshold region, because it is a model rather
+# than tabulated data.  ``REGION_LINEAR_RISE`` keeps the original name (the
+# linear rise is still the default model) and ``REGION_NEAR_THRESHOLD`` is the
+# model-neutral alias.
 REGION_BELOW_THRESHOLD = 0
 REGION_LINEAR_RISE = 1
+REGION_NEAR_THRESHOLD = 1
 REGION_TABULATED = 2
 REGION_POWER_LAW = 3
+
+# Interpolation models for the gap between the ionization threshold and the
+# first usable tabulated point.  This region is entered unavoidably whenever
+# the omega/omega_eff weight is on, because omega_eff(mu) -> I_mu as the
+# energy sharing eps1 -> 0, so the tabulation gets read at its own onset
+# (REVIEW.md [A-12]).
+#
+# The choice is not cosmetic and it is not arbitrary.  What happens to an
+# atomic subshell cross section at threshold depends on the final-state
+# potential:
+#
+#   * COULOMB final state (a real atom: the residual ion is charged).  The
+#     Coulomb penetration factor |C_0|^2 = 2 pi nu / (1 - exp(-2 pi nu))
+#     with nu = Z/k diverges as 2 pi/k for k -> 0, cancelling the phase-space
+#     suppression.  The exact hydrogenic (Stobbe) result therefore approaches
+#     a FINITE constant: sigma_0 = 2^9 pi^2/(3 e^4) alpha a0^2 = 6.3043 Mb for
+#     H 1s, matching the tabulated 6.30 Mb.  This is what Yeh-Lindau data is,
+#     and the measured log-log slopes of the first two tabulated points bear
+#     it out: -0.02 (F1s), +0.00 (S2s), -0.05 (S1s) -- flat, not rising.
+#
+#   * SHORT-RANGE or PLANE-WAVE final state.  No penetration factor, so the
+#     Wigner law sigma ~ (hv - I)^(l'+1/2) survives; for an l'=1 outgoing
+#     electron that is eps^1.5, verified against the plane-wave hydrogenic
+#     cross section (slope +1.500 at eps = 1e-3 Ha).
+#
+# So WIGNER is the wrong law for a tabulated atomic sigma and the right one
+# for a model whose continuum is a plane wave -- which is what this code uses
+# everywhere else.  Both are offered because that tension is real and
+# unresolved: see the ``threshold_model`` docstring on SigmaBuilder.
+THRESHOLD_MODELS = ("linear", "flat", "coulomb", "wigner", "extrapolate",
+                    "anchored")
+
+#: Offset of the second artificial knot above the threshold, eV.  See
+#: :func:`_anchored_knots`.
+ANCHOR_DELTA_EV = 0.1
+
+# ``extrapolate`` is the "why model it at all?" option: continue the log-log
+# spline itself backwards into the gap, treating the near-threshold value as
+# an interpolation question rather than a physics question.  Its merit is
+# that it assumes nothing beyond the data's own local shape, and on the
+# shipped table it agrees with ``coulomb`` to 0.1% for every subshell whose
+# lever arm is short -- an independent confirmation, from an agnostic
+# interpolant, of the Coulomb argument above.
+#
+# It is NOT safe over a long lever arm, and fails far more violently than a
+# shape model does when abused: extrapolating a cubic in log-log space away
+# from its knots is unbounded.  For S_3p (arm 0.61) the not-a-knot spline
+# returns 3.9x sigma_lo, a natural-boundary spline 28x, and an Akima
+# interpolant 25x -- against 3.6x for ``coulomb``, which at least cannot
+# exceed the Stobbe shape.  ``unsafe_extrapolations`` therefore flags this
+# model exactly as it flags ``coulomb``.
+
+# Wigner exponent l' + 1/2 for the dominant outgoing partial wave, keyed by
+# the angular momentum l of the bound orbital.  sigma ~ k^(2l'+1) and
+# eps = k^2/2, hence sigma ~ eps^(l' + 1/2).  A dipole transition from l
+# reaches l' = l +- 1, and the LOWER channel dominates at threshold because
+# its centrifugal barrier is smaller -- so l' = l - 1 where that exists, and
+# l' = 1 from an s orbital, which has no lower channel:
+#
+#   l = 0 (s) -> l' = 1 only     -> 1.5
+#   l = 1 (p) -> l' = 0 dominates -> 0.5
+#   l = 2 (d) -> l' = 1 dominates -> 1.5
+#   l = 3 (f) -> l' = 2 dominates -> 2.5
+_WIGNER_EXPONENT = {0: 1.5, 1: 0.5, 2: 1.5, 3: 2.5}
+
+# Angular momentum of each tabulated subshell, for the Wigner exponent.
+_SUBSHELL_L = {"s": 0, "p": 1, "d": 2, "f": 3}
 
 # Exponent of a hydrogenic cross section well above threshold.  Supplied as
 # a named constant because it is the physically motivated override for
@@ -473,9 +547,12 @@ class _Evaluator:
     sigma_lo: float
     default_exponent: float
     n_dropped: int
+    anchored: PchipInterpolator | None = None
+    anchor_hv: float = 0.0
+    anchor_sigma: float = 0.0
 
 
-_EVALUATORS: dict[str, _Evaluator] = {}
+_EVALUATORS: dict[tuple[str, float], _Evaluator] = {}
 
 
 def _entry(element: str, subshell: str) -> SubshellData:
@@ -489,17 +566,134 @@ def _entry(element: str, subshell: str) -> SubshellData:
         ) from None
 
 
-def _evaluator(element: str, subshell: str) -> _Evaluator:
+def _first_real_point(data: SubshellData) -> float | None:
+    """Lowest tabulated energy strictly above the declared threshold.
+
+    This is the boundary the ``"anchored"`` model bridges to, and it differs
+    from ``_Evaluator.hv_lo`` for the two entries whose grid starts below
+    their own threshold.
+    """
+    real = [h for h, sg in zip(data.hv_ev, data.sigma_mb)
+            if h > data.threshold_ev and sg > 0.0]
+    return float(min(real)) if real else None
+
+
+def _anchored_knots(
+    data: SubshellData, delta_ev: float | None = None
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Build the knot set for the ``"anchored"`` near-threshold model.
+
+    The recipe, in five steps:
+
+    1. Discard every tabulated point at or below ``threshold_ev``.  For the
+       two straddling entries (F 1s, S 2s) this *removes* real data, which
+       is the deliberate trade: the model needs a clean statement of where
+       the onset is, and mixing a published point below the declared
+       threshold with an artificial zero *at* it is contradictory.
+    2. Insert an artificial knot at ``I_mu`` and a second at
+       ``I_mu + delta_ev``.
+    3. The first carries ``sigma = 0`` exactly -- the physical boundary
+       condition that no model here previously imposed.
+    4. The second carries the value obtained by extrapolating the *cleaned
+       original* data (log-log cubic) to that energy.  This is what keeps
+       the rise physical rather than linear: the slope leaving the
+       threshold is inherited from the data instead of assumed.
+    5. Interpolate the union.
+
+    Step 3 forces the interpolation variable.  Every other model works in
+    ``log sigma``, and ``log 0`` is ``-inf``, so the assembled curve must be
+    interpolated in **linear** ``sigma`` against **linear** ``hv``.  That is
+    a real difference in character, not a detail: the interpolant is no
+    longer exact on a power law.  Between the artificial knots and the first
+    real one the curve is a cubic in ``hv``, and above ``hv_lo`` the
+    ``anchored`` model hands back to the ordinary log-log spline, so the
+    change is confined to the gap.
+
+    PCHIP rather than a natural cubic for the union: it is shape-preserving,
+    so ``sigma`` cannot dip negative between the zero at ``I_mu`` and the
+    first positive knot.  A cubic through the same points does undershoot,
+    which would be unphysical.
+
+    Returns
+    -------
+    hv_knots, sigma_knots, sigma_at_delta
+    """
+    # Read the module global at CALL time, not as a default argument -- a
+    # default binds once at definition and would silently ignore any later
+    # change to ANCHOR_DELTA_EV, making the offset look insensitive when it
+    # is in fact never varying.
+    if delta_ev is None:
+        delta_ev = ANCHOR_DELTA_EV
+    thr = float(data.threshold_ev)
+    hv = np.asarray(data.hv_ev, dtype=float)
+    sig = np.asarray(data.sigma_mb, dtype=float)
+
+    keep = (hv > thr) & (sig > 0.0)                       # step 1
+    hv, sig = hv[keep], sig[keep]
+    if hv.size < 4:
+        raise ModelError(
+            f"{data.element} {data.subshell}: only {hv.size} tabulated "
+            f"points survive above the {thr} eV threshold; the anchored "
+            f"model needs 4 to extrapolate from"
+        )
+    order = np.argsort(hv)
+    hv, sig = hv[order], sig[order]
+
+    anchor_hv = thr + float(delta_ev)
+    if anchor_hv >= hv[0]:
+        # The second artificial point would land on or past the first real
+        # one.  Nothing to bridge: return the data with only the zero.
+        return (np.concatenate([[thr], hv]),
+                np.concatenate([[0.0], sig]),
+                float(sig[0]))
+
+    ext = CubicSpline(np.log(hv), np.log(sig), extrapolate=True)  # step 4
+    with np.errstate(over="ignore"):
+        s_anchor = float(np.exp(ext(np.log(anchor_hv))))
+    if not np.isfinite(s_anchor) or s_anchor <= 0.0:
+        s_anchor = float(sig[0])
+
+    hv_k = np.concatenate([[thr, anchor_hv], hv])          # steps 2, 3
+    sg_k = np.concatenate([[0.0, s_anchor], sig])
+    return hv_k, sg_k, s_anchor
+
+
+def _evaluator(element: str, subshell: str,
+               delta_ev: float | None = None) -> _Evaluator:
     """Build (once) the log-log spline and power-law tail for a subshell.
 
-    Tabulated points at or below the threshold are discarded: the cross
-    section is identically zero there, so such points are digitisation
-    artefacts of the published curves (F 1s and S 2s each have one).
-    Keeping them would let the spline return a finite value below
-    threshold.
+    Every point with ``sigma > 0`` is kept, **including any that lie below
+    the declared** ``threshold_ev``.  Those points are not artefacts: they
+    are the published curve's own data, and their existence means the
+    tabulation's implicit onset is *lower* than the threshold this table
+    declares.  F 1s has a point at 690.0 eV against a declared 692.3 eV,
+    and S 2s one at 225.0 against 229.2 -- the two values come from
+    different sources (round-number photon-energy grids from the
+    digitisation, experimental binding energies for the threshold), and
+    they are not required to agree to better than a grid spacing.
+
+    Discarding them used to have a consequence out of all proportion to
+    two data points: it moved ``hv_lo`` up to the first point *above* the
+    threshold, manufacturing a 2.7 eV "gap" for F 1s where the tabulation
+    in fact has data on both sides.  Since F 1s carries ~70% of the
+    intensity of an F1s-edge CV spectrum, most of what looked like
+    near-threshold model dependence was this bookkeeping.  Keeping the
+    points makes evaluation there ordinary spline interpolation.
+
+    ``sigma`` is still exactly zero at and below ``threshold_ev`` -- that
+    is physics, and :func:`sigma_region` enforces it independently of the
+    spline's domain.
     """
     key = f"{element}_{subshell}"
-    cached = _EVALUATORS.get(key)
+    # The anchored knot set depends on ``delta_ev``, so it must be part of
+    # the cache key.  Keying on the subshell alone would return the first
+    # caller's offset to every later one -- which is exactly the class of
+    # bug that made the delta sweep look flat while it was being developed.
+    if delta_ev is None:
+        delta_ev = ANCHOR_DELTA_EV
+    delta_ev = float(delta_ev)
+    cache_key = (key, delta_ev)
+    cached = _EVALUATORS.get(cache_key)
     if cached is not None:
         return cached
 
@@ -512,13 +706,13 @@ def _evaluator(element: str, subshell: str) -> _Evaluator:
             f"{sig.size}; the table is corrupt"
         )
 
-    keep = (hv > data.threshold_ev) & (sig > 0.0)
+    keep = sig > 0.0
     n_dropped = int(hv.size - keep.sum())
     hv, sig = hv[keep], sig[keep]
     if hv.size < 4:
         raise ModelError(
-            f"{key}: only {hv.size} usable tabulated points above the "
-            f"{data.threshold_ev} eV threshold; a cubic spline needs 4"
+            f"{key}: only {hv.size} tabulated points with a positive cross "
+            f"section; a cubic spline needs 4"
         )
     order = np.argsort(hv)
     hv, sig = hv[order], sig[order]
@@ -539,6 +733,18 @@ def _evaluator(element: str, subshell: str) -> _Evaluator:
     default_exponent = float(
         (log_sigma[-1] - log_sigma[-2]) / (log_hv[-1] - log_hv[-2])
     )
+    # The "anchored" model needs its own knot set and interpolant: it drops
+    # the sub-threshold points the main spline keeps, and it works in linear
+    # sigma because one of its knots is exactly zero.  Built here so the cost
+    # is paid once per subshell, like the main spline.
+    try:
+        a_hv, a_sg, a_val = _anchored_knots(data, delta_ev)
+        anchored = PchipInterpolator(a_hv, a_sg, extrapolate=False)
+        anchor_hv = float(a_hv[1]) if a_hv.size > 1 else float(a_hv[0])
+        anchor_sigma = float(a_val)
+    except ModelError:
+        anchored, anchor_hv, anchor_sigma = None, 0.0, 0.0
+
     ev = _Evaluator(
         data=data,
         spline=spline,
@@ -549,6 +755,9 @@ def _evaluator(element: str, subshell: str) -> _Evaluator:
         sigma_lo=float(sig[0]),
         default_exponent=default_exponent,
         n_dropped=n_dropped,
+        anchored=anchored,
+        anchor_hv=anchor_hv,
+        anchor_sigma=anchor_sigma,
     )
     _EVALUATORS[key] = ev
     return ev
@@ -604,11 +813,156 @@ def sigma_region(
     return codes
 
 
+def _near_threshold(ev, hv: np.ndarray, model: str) -> np.ndarray:
+    """Cross section between the threshold and the first tabulated point.
+
+    Every model is normalised to pass through ``(hv_lo, sigma_lo)``, so the
+    result is continuous with the spline and the *only* thing that changes
+    is the shape of the approach to threshold.  That makes the four
+    directly comparable: any difference in an integrated intensity is
+    attributable to the shape alone, not to a discontinuity.
+
+    Parameters
+    ----------
+    ev : _Evaluator
+        Carries ``data.threshold_ev``, ``hv_lo`` and ``sigma_lo``.
+    hv : ndarray
+        Photon energies strictly inside ``(threshold, hv_lo)``.
+    model : str
+        One of :data:`THRESHOLD_MODELS`.
+
+    Returns
+    -------
+    ndarray
+        Cross sections in Mb, same shape as ``hv``.
+    """
+    if model not in THRESHOLD_MODELS:
+        raise ConfigError(
+            f"threshold_model must be one of {THRESHOLD_MODELS}, "
+            f"got {model!r}"
+        )
+    thr = float(ev.data.threshold_ev)
+
+    if model == "anchored":
+        # Handled before the ``span`` guard below, because this model does
+        # not measure against ``ev.hv_lo``: it discards the sub-threshold
+        # points that ``hv_lo`` may sit on and bridges to the first
+        # *surviving* real point instead.  For F 1s and S 2s, ``span`` is
+        # negative and the guard would return ``sigma_lo`` -- the value of a
+        # point this model has deliberately dropped.
+        if ev.anchored is None:
+            raise ModelError(
+                f"{ev.data.element} {ev.data.subshell}: the anchored model "
+                f"could not be built for this subshell"
+            )
+        out = np.asarray(ev.anchored(hv), dtype=float)
+        # PCHIP is shape-preserving, so it cannot undershoot below the zero
+        # knot; the clamp guards only against a NaN from an hv outside the
+        # knot range, which the region logic should already prevent.
+        return np.where(np.isfinite(out), np.maximum(out, 0.0), 0.0)
+
+    span = float(ev.hv_lo) - thr
+    s_lo = float(ev.sigma_lo)
+    if span <= 0.0:                     # first tabulated point at threshold
+        return np.full(hv.shape, s_lo)
+    x = (hv - thr) / span               # 0 at threshold, 1 at hv_lo
+
+    if model == "linear":
+        # Historical default: sigma_lo * x.  Vanishes at threshold with slope
+        # 1, which no final-state potential produces -- kept because every
+        # spectrum computed before this option existed used it.
+        return s_lo * x
+
+    if model == "flat":
+        # sigma_lo held constant down to threshold.  Crude, but it is the
+        # correct *limit* for a Coulomb final state (see below), so it
+        # brackets 'coulomb' from above and costs nothing to evaluate.
+        return np.full(hv.shape, s_lo)
+
+    if model == "wigner":
+        # sigma ~ (hv - I)^(l' + 1/2), the threshold law for a SHORT-RANGE
+        # final state.  Correct for the plane-wave continuum this model uses
+        # elsewhere; NOT correct for a tabulated atomic sigma, whose residual
+        # ion is charged.  The exponent follows the bound orbital's l.
+        letter = ev.data.subshell[-1].lower()
+        if letter not in _SUBSHELL_L:
+            raise ConfigError(
+                f"cannot infer the angular momentum of subshell "
+                f"{ev.data.subshell!r} for the Wigner exponent; the label "
+                f"must end in one of {sorted(_SUBSHELL_L)}"
+            )
+        p = _WIGNER_EXPONENT[_SUBSHELL_L[letter]]
+        return s_lo * x ** p
+
+    if model == "extrapolate":
+        # Continue the log-log spline backwards.  ``CubicSpline`` is built
+        # with ``extrapolate=False`` so that an accidental out-of-range
+        # evaluation returns NaN rather than nonsense; here the extension is
+        # deliberate, so build a one-off extrapolating view of the same
+        # knots.  Anything non-finite (possible if the extension dives) is
+        # clamped to the flat value, which is the nearest defensible answer.
+        ext = CubicSpline(ev.log_hv, ev.log_sigma, extrapolate=True)
+        with np.errstate(over="ignore"):
+            out = np.exp(ext(np.log(hv)))
+        return np.where(np.isfinite(out) & (out > 0.0), out, s_lo)
+
+    # model == "coulomb": the exact hydrogenic (Stobbe) energy dependence,
+    # scaled to match sigma_lo at hv_lo.  Only the SHAPE is hydrogenic; the
+    # magnitude stays the tabulated one, so this does not import a hydrogenic
+    # cross section into a many-electron subshell.
+    #
+    # The extrapolation is only trustworthy over a SHORT lever arm.  The
+    # Stobbe shape is monotone falling, so if the first tabulated point
+    # already sits past the subshell's maximum -- which for S_3p it does,
+    # 61% above threshold with a local log-log slope of -2.5 -- then
+    # extrapolating that shape backwards manufactures a rise (3.6x sigma_lo)
+    # that the real curve does not have.  ``lever_arm`` records
+    # (hv_lo - I)/I so a caller can see which groups are safe: it is 0.3-0.4%
+    # for the core subshells that carry the intensity and 61% for S_3p.
+    #
+    #   sigma(x) ~ x^-4 exp(4 - 4 arctan(eta)/eta) / (1 - exp(-2 pi/eta)),
+    #   x = hv/I,  eta = sqrt(x - 1)
+    #
+    # As eta -> 0 both exponential factors -> 1 and sigma -> sigma(I), finite.
+    # This is why a tabulated atomic sigma is flat at threshold rather than
+    # vanishing: the Coulomb penetration factor 2 pi nu/(1 - exp(-2 pi nu))
+    # ~ 2 pi/k cancels the phase-space suppression.
+    shape = _stobbe_shape(hv / thr)
+    shape_lo = float(_stobbe_shape(np.asarray([ev.hv_lo / thr]))[0])
+    if not np.isfinite(shape_lo) or shape_lo <= 0.0:
+        return np.full(hv.shape, s_lo)
+    return s_lo * shape / shape_lo
+
+
+def _stobbe_shape(x: np.ndarray) -> np.ndarray:
+    """Hydrogenic 1s photoionization energy dependence, up to a constant.
+
+    ``x = hv / I >= 1``.  Returns
+    ``x^-4 exp(4 - 4 arctan(eta)/eta) / (1 - exp(-2 pi/eta))`` with
+    ``eta = sqrt(x - 1)``, continuous at ``x = 1`` where both exponential
+    factors tend to 1 and the value is finite (this is the whole point --
+    see :func:`_near_threshold`).  Verified against the literature H 1s
+    threshold cross section, 6.30 Mb.
+    """
+    x = np.atleast_1d(np.asarray(x, dtype=float))
+    eta = np.sqrt(np.maximum(x - 1.0, 0.0))
+    out = np.empty(x.shape, dtype=float)
+    tiny = eta < 1e-7
+    out[tiny] = x[tiny] ** -4.0
+    e = eta[~tiny]
+    out[~tiny] = (x[~tiny] ** -4.0
+                  * np.exp(4.0 - 4.0 * np.arctan(e) / e)
+                  / (1.0 - np.exp(-2.0 * np.pi / e)))
+    return out
+
+
 def sigma(
     element: str,
     subshell: str,
     hv_ev: float | np.ndarray,
     high_energy_exponent: float | None = None,
+    threshold_model: str = "linear",
+    anchor_delta_ev: float | None = None,
 ) -> float | np.ndarray:
     """Atomic subshell photoionization cross section, Mb.
 
@@ -618,12 +972,12 @@ def sigma(
     ``hv <= threshold``
         zero, exactly.
     ``threshold < hv < hv_lo`` (below the first usable tabulated point)
-        linear rise, ``sigma_lo * (hv - threshold) / (hv_lo - threshold)``.
-        This is a **stopgap**, not physics: the true near-threshold shape
-        depends on the centrifugal barrier and on autoionizing resonances,
-        neither of which is in the tabulation.  Use
-        :func:`sigma_region` (or :attr:`SigmaBuilder.used_linear_rise`) to
-        detect reliance on it and say so in an output header.
+        one of four models selected by ``threshold_model``; all are
+        continuous with the spline at ``hv_lo``.  This region is a
+        **model**, not tabulated data, and none of the four captures
+        autoionizing resonances.  Use :func:`sigma_region` (or
+        :attr:`SigmaBuilder.used_linear_rise`) to detect reliance on it and
+        say so in an output header.  See :data:`THRESHOLD_MODELS`.
     ``hv_lo <= hv <= hv_hi``
         cubic spline in ``(log hv, log sigma)``; exact at the knots.
     ``hv > hv_hi``
@@ -637,6 +991,14 @@ def sigma(
         e.g. ``'F'``, ``'1s'``.
     hv_ev : float or ndarray
         Photon energy, eV.  Vectorised; the result has the input shape.
+    threshold_model : str, optional
+        ``'linear'`` (default, the historical behaviour), ``'flat'``,
+        ``'coulomb'`` or ``'wigner'``; see :data:`THRESHOLD_MODELS`.  For a
+        tabulated *atomic* cross section ``'coulomb'`` is the physically
+        correct family and ``'wigner'`` is not, because the residual ion is
+        charged; ``'wigner'`` is offered because the model's own continuum
+        is a plane wave, for which it *is* correct.  Reported as a
+        sensitivity, not resolved.
     high_energy_exponent : float, optional
         Replaces the fitted slope in the power-law region.  Yeh--Lindau
         stops at 1500 eV while the S 1s edge is used at 2610 eV, so the
@@ -650,7 +1012,7 @@ def sigma(
     float or ndarray
         Cross section in Mb; float for scalar input.
     """
-    ev = _evaluator(element, subshell)
+    ev = _evaluator(element, subshell, anchor_delta_ev)
     if high_energy_exponent is None:
         exponent = ev.default_exponent
     else:
@@ -669,10 +1031,23 @@ def sigma(
 
     codes = sigma_region(element, subshell, hv)
 
-    rise = codes == REGION_LINEAR_RISE
+    if threshold_model == "anchored":
+        # The anchored model owns a *wider* region than the others.  Step 1
+        # discards the points at or below ``threshold_ev``, so for the two
+        # straddling entries (F 1s, S 2s) the main spline's lower bound sits
+        # BELOW the threshold and ``sigma_region`` reports no near-threshold
+        # region at all -- the anchored knots would then never be consulted
+        # and the model would silently reduce to the plain spline.  Reclaim
+        # everything between the threshold and the first *surviving* real
+        # point, which is exactly the interval the artificial knots bridge.
+        first_real = _first_real_point(ev.data)
+        if first_real is not None:
+            reclaim = (hv > ev.data.threshold_ev) & (hv < first_real)
+            codes = np.where(reclaim, REGION_NEAR_THRESHOLD, codes)
+
+    rise = codes == REGION_NEAR_THRESHOLD
     if np.any(rise):
-        thr = ev.data.threshold_ev
-        out[rise] = ev.sigma_lo * (hv[rise] - thr) / (ev.hv_lo - thr)
+        out[rise] = _near_threshold(ev, hv[rise], threshold_model)
 
     inside = codes == REGION_TABULATED
     if np.any(inside):
@@ -746,6 +1121,18 @@ class SigmaBuilder:
         ``{'<element>_<subshell>': exponent}`` overriding the fitted
         power-law tail for individual subshells, e.g.
         ``{'F_1s': HYDROGENIC_EXPONENT}``.
+    threshold_overrides : mapping, optional
+        ``{'<element>_<subshell>': I_mu_ev}`` replacing the tabulated
+        free-atom threshold.  The default :math:`I_\\mu` is the free-atom
+        value that comes with the Yeh--Lindau entry, which is the choice
+        consistent with substituting a free-atom :math:`\\sigma`; this
+        override exists because that choice is *not* obviously right for
+        valence subshells, whose binding energies shift on bonding, and
+        because :math:`I_\\mu` enters twice -- as the :math:`\\sigma`
+        argument and as the denominator of the
+        ``omega_over_omega_eff`` weight -- so an error in it does not
+        cancel.  Sensitivity is roughly 2% per eV at the F1s edge; see
+        REVIEW.md [A-13].  Overriding shifts *both* uses consistently.
 
     Attributes
     ----------
@@ -765,8 +1152,12 @@ class SigmaBuilder:
         subshell_map: Mapping[str, Mapping[tuple[int, int], str]] | None
         = None,
         high_energy_exponents: Mapping[str, float] | None = None,
+        threshold_overrides: Mapping[str, float] | None = None,
+        threshold_model: str = "linear",
+        anchor_delta_ev: float = ANCHOR_DELTA_EV,
     ) -> None:
         self.basis = basis
+        self.anchor_delta_ev = float(anchor_delta_ev)
         self.subshell_map = (
             DEFAULT_SUBSHELL_MAP if subshell_map is None
             else {k: dict(v) for k, v in subshell_map.items()}
@@ -778,8 +1169,139 @@ class SigmaBuilder:
                     f"high_energy_exponents names unknown subshell "
                     f"{key!r}; available: {sorted(YEH_LINDAU)}"
                 )
+        self.threshold_overrides = {
+            k: float(v) for k, v in dict(threshold_overrides or {}).items()
+        }
+        for key, val in self.threshold_overrides.items():
+            if key not in YEH_LINDAU:
+                raise ConfigError(
+                    f"threshold_overrides names unknown subshell "
+                    f"{key!r}; available: {sorted(YEH_LINDAU)}"
+                )
+            if not np.isfinite(val) or val <= 0.0:
+                raise ConfigError(
+                    f"threshold_overrides[{key!r}] = {val!r} must be a "
+                    f"positive, finite ionization threshold in eV"
+                )
+        if threshold_model not in THRESHOLD_MODELS:
+            raise ConfigError(
+                f"threshold_model must be one of {THRESHOLD_MODELS}, "
+                f"got {threshold_model!r}"
+            )
+        self.threshold_model = str(threshold_model)
         self._assign = self._resolve(basis)
         self.used_linear_rise = False
+
+    def lever_arm(self, key: str) -> float:
+        """``(hv_lo - I_mu) / I_mu``: how far the table starts above threshold.
+
+        The fraction of the threshold energy over which a near-threshold
+        model has to extrapolate.  Small means the gap is a sliver of the
+        curve and any smooth model is safe there; large means the first
+        tabulated point may already be past the subshell maximum, in which
+        case the monotone-falling ``coulomb`` shape extrapolates backwards
+        through a peak it cannot see.
+
+        Measured on the shipped table: 0.003 (S_1s), 0.004 (F_1s, S_2s),
+        0.03 (S_2p), 0.06 (F_2s), 0.15 (F_2p), 0.21 (S_3s), 0.61 (S_3p).
+        """
+        entry = YEH_LINDAU[key]
+        thr = self.threshold_of(key)
+        if thr <= 0.0:
+            return 0.0
+        # Measure against the lower bound of the knot set the ACTIVE model
+        # actually uses.  The main spline keeps points below ``threshold_ev``
+        # (F 1s at 690.0 eV, S 2s at 225.0), so for those two the grid
+        # straddles the threshold and the arm is zero -- but the ``anchored``
+        # model discards them by construction (its step 1), which restores a
+        # gap it must bridge.  Reporting zero there would hide exactly the
+        # extrapolation ``anchored`` performs in its step 4.
+        ev = _evaluator(entry.element, entry.subshell, self.anchor_delta_ev)
+        lo = ev.hv_lo
+        if self.threshold_model == "anchored":
+            real = [h for h, sg in zip(entry.hv_ev, entry.sigma_mb)
+                    if h > entry.threshold_ev and sg > 0.0]
+            if real:
+                lo = min(real)
+        return max(0.0, (lo - thr) / thr)
+
+    def unsafe_extrapolations(self, tol: float = 0.10,
+                              disagreement: float = 0.15) -> tuple[str, ...]:
+        """Groups whose near-threshold model should not be trusted.
+
+        A group is flagged when **either** test fails:
+
+        1. :meth:`lever_arm` exceeds ``tol`` -- the model must reach across
+           more than ``tol`` of the threshold energy.  ``S_3p`` (arm 0.61)
+           is the shipped table's example: it begins past its own maximum,
+           so a monotone shape extrapolated backwards manufactures a rise.
+        2. ``coulomb`` and ``extrapolate`` disagree at the threshold by more
+           than ``disagreement`` in relative terms.  These two are
+           independent -- one is the hydrogenic energy dependence, the other
+           the tabulated curve's own local shape -- so when they agree the
+           answer is corroborated and when they diverge neither can be
+           trusted, whatever the lever arm says.
+
+        The second test is not redundant.  ``S_2p`` has a lever arm of only
+        0.028 and still fails it badly (ratio 0.14): its first two tabulated
+        points *rise* 62%, a delayed maximum at the edge, so the local
+        log-log slope at the first knot is ``+17`` and a backwards extension
+        plunges.  A distance criterion alone cannot see that; comparing two
+        independent estimates can.
+
+        Empty for ``linear`` and ``flat``, which anchor only on ``sigma_lo``
+        and so cannot manufacture structure, and for ``wigner``, whose
+        exponent is fixed by the outgoing partial wave rather than fitted to
+        the tabulated curve.
+
+        On the shipped table this flags ``F_2p``, ``F_2s``, ``S_2p``,
+        ``S_3p`` and ``S_3s``, leaving ``F_1s``, ``S_1s`` and ``S_2s`` --
+        which carry 94.6% of an F1s-edge CV spectrum's intensity.
+        """
+        if self.threshold_model not in ("coulomb", "extrapolate", "anchored"):
+            return ()
+        flagged = []
+        for key in self.subshells_used:
+            if self.lever_arm(key) > tol:
+                flagged.append(key)
+                continue
+            entry = YEH_LINDAU[key]
+            thr = self.threshold_of(key)
+            if self.lever_arm(key) == 0.0:
+                continue                      # no gap: nothing is modelled
+            # Compare two independent estimates *of the same quantity*.  For
+            # ``anchored`` that quantity is its step-4 knot value, which is
+            # the log-log extrapolation to ``I + delta``; ``sigma`` at the
+            # threshold itself is zero by construction and so carries no
+            # information about whether the extrapolation is sound.
+            if self.threshold_model == "anchored":
+                ev = _evaluator(entry.element, entry.subshell,
+                                self.anchor_delta_ev)
+                probe = ev.anchor_hv if ev.anchor_hv > thr else thr + 1e-9
+            else:
+                probe = thr + 1e-9
+            a = float(sigma(entry.element, entry.subshell, probe, None,
+                            threshold_model="coulomb",
+                            anchor_delta_ev=self.anchor_delta_ev))
+            b = float(sigma(entry.element, entry.subshell, probe, None,
+                            threshold_model="extrapolate",
+                            anchor_delta_ev=self.anchor_delta_ev))
+            scale = max(abs(a), abs(b), 1e-30)
+            if abs(a - b) / scale > disagreement:
+                flagged.append(key)
+        return tuple(sorted(flagged))
+
+    def threshold_of(self, key: str) -> float:
+        """Threshold :math:`I_\\mu` in use for a table key, eV.
+
+        The override if one was supplied, else the tabulated free-atom
+        value.  Every place that needs :math:`I_\\mu` goes through here, so
+        an override cannot be applied to one of its two uses and not the
+        other.
+        """
+        if key in self.threshold_overrides:
+            return self.threshold_overrides[key]
+        return float(YEH_LINDAU[key].threshold_ev)
 
     def _resolve(self, basis) -> _AoAssignment:
         for attr in ("nbas", "elements", "l", "shell_index"):
@@ -822,7 +1344,7 @@ class SigmaBuilder:
                     f"{sorted(YEH_LINDAU)}"
                 )
             keys.append(key)
-            thresholds[mu] = YEH_LINDAU[key].threshold_ev
+            thresholds[mu] = self.threshold_of(key)
             groups.setdefault(key, []).append(mu)
 
         return _AoAssignment(
@@ -862,7 +1384,8 @@ class SigmaBuilder:
         """Table keys actually reached by this basis, sorted."""
         return tuple(sorted(self._assign.groups))
 
-    def at_eps1_grid(self, eps1_ev: np.ndarray) -> np.ndarray:
+    def at_eps1_grid(self, eps1_ev: np.ndarray,
+                     omega_ev: float | None = None) -> np.ndarray:
         """Per-AO cross sections on a whole energy-sharing grid.
 
         Evaluates :math:`\\sigma_\\mu(\\varepsilon_1 + I_\\mu)` -- see
@@ -874,6 +1397,13 @@ class SigmaBuilder:
         eps1_ev : ndarray, shape (nq,)
             Kinetic energy of the fast photoelectron at each quadrature
             point, eV.
+        omega_ev : float, optional
+            Photon energy, eV.  When given, each AO column is multiplied by
+            ``omega_ev / (eps1 + I_mu)``, the residual normalisation factor
+            left over when the tabulated ``sigma^AO`` replaces the computed
+            dipole matrix element (REVIEW.md [A-8]).  When ``None`` the
+            weight is omitted, reproducing the behaviour of every result
+            obtained before this option existed.
 
         Returns
         -------
@@ -885,26 +1415,61 @@ class SigmaBuilder:
             raise ConfigError(
                 f"eps1_ev must be 1-D, got shape {eps1.shape}"
             )
+        if omega_ev is not None and not np.isfinite(omega_ev):
+            raise ConfigError(
+                f"omega_ev must be finite when given, got {omega_ev!r}"
+            )
         out = np.zeros((eps1.size, self.nbas), dtype=float)
         for key, cols in self._assign.groups.items():
             entry = YEH_LINDAU[key]
-            hv = eps1 + entry.threshold_ev
+            # I_mu via threshold_of, so a [physics] threshold_override moves
+            # the sigma argument AND the omega/omega_eff denominator below by
+            # the same amount.  Note that it deliberately does *not* move the
+            # tabulated curve's own threshold: sigma^AO is a free-atom
+            # property and keeps its free-atom onset, while I_mu is the
+            # offset between eps1 and the photon energy at which that curve
+            # is read.  Overriding one without the other would be incoherent.
+            hv = eps1 + self.threshold_of(key)
             vals = sigma(
                 entry.element, entry.subshell, hv,
                 self.high_energy_exponents.get(key),
+                threshold_model=self.threshold_model,
+                anchor_delta_ev=self.anchor_delta_ev,
             )
             if np.any(
                 sigma_region(entry.element, entry.subshell, hv)
                 == REGION_LINEAR_RISE
             ):
                 self.used_linear_rise = True
-            # One spline evaluation for the whole grid, broadcast to every
-            # AO of this subshell: sigma depends on the AO only through
-            # (element, subshell), so AOs in a group share a column value.
-            out[:, cols] = vals[:, None] # type: ignore
+            if omega_ev is not None:
+                # Substituting a *tabulated* sigma^AO for the computed dipole
+                # matrix element imports sigma's own normalisation: inverting
+                # its definition (notes Eq. 93, with
+                # omega_eff of Definition 1 = Eq.
+                # (92)) via Eq. (99) yields
+                #
+                #   INT dOmega_k1 sum_alpha |<psi_k1|r_alpha|chi_mu>|^2
+                #       = sigma_mu(w_eff) * 3c / (4 pi^2 w_eff k_1)
+                #
+                # The 1/k_1 cancels the sDCS prefactor's k_1 and the 1/3
+                # cancels its polarisation average -- Eq. (94),
+                # applied once only (Remark 3) -- but the
+                # prefactor carries
+                # the MOLECULAR omega while sigma carries the PER-AO
+                # w_eff = eps1 + I_mu.  Their ratio does not cancel and is a
+                # function of eps1, so it cannot be hoisted into a scalar
+                # prefactor -- it belongs here, inside the per-AO loop, where
+                # w_eff is known.  See NORMALISATION.md and REVIEW.md [A-8].
+                out[:, cols] = (vals * (float(omega_ev) / hv))[:, None]
+            else:
+                # One spline evaluation for the whole grid, broadcast to every
+                # AO of this subshell: sigma depends on the AO only through
+                # (element, subshell), so AOs in a group share a column value.
+                out[:, cols] = vals[:, None]
         return out
 
-    def at_eps1(self, eps1_ev: float) -> np.ndarray:
+    def at_eps1(self, eps1_ev: float,
+                omega_ev: float | None = None) -> np.ndarray:
         """Per-AO cross sections at one energy sharing.
 
         Parameters
@@ -917,7 +1482,8 @@ class SigmaBuilder:
         ndarray, shape (nbas,)
             Cross sections in Mb.
         """
-        return self.at_eps1_grid(np.asarray([float(eps1_ev)]))[0]
+        return self.at_eps1_grid(np.asarray([float(eps1_ev)]),
+                                 omega_ev=omega_ev)[0]
 
     def report(self) -> dict[str, object]:
         """Summary for an output header.
@@ -927,7 +1493,11 @@ class SigmaBuilder:
         dict
             ``nbas``, ``n_assigned``, ``n_unassigned``,
             ``unassigned_indices``, ``subshells_used``,
-            ``used_linear_rise`` and ``provenance``.
+            ``used_linear_rise``, ``thresholds_ev``,
+            ``threshold_overrides`` and ``provenance``.  The thresholds are
+            reported because :math:`I_\\mu` is a modelling choice with a
+            ~2%/eV effect (REVIEW.md [A-13]), so a spectrum is not
+            reproducible without them.
         """
         return {
             "nbas": self.nbas,
@@ -936,5 +1506,12 @@ class SigmaBuilder:
             "unassigned_indices": self.unassigned_indices.tolist(),
             "subshells_used": self.subshells_used,
             "used_linear_rise": self.used_linear_rise,
+            "threshold_model": self.threshold_model,
+            "anchor_delta_ev": self.anchor_delta_ev,
+            "lever_arm": {k: self.lever_arm(k) for k in self.subshells_used},
+            "unsafe_extrapolations": self.unsafe_extrapolations(),
+            "thresholds_ev": {k: self.threshold_of(k)
+                              for k in self.subshells_used},
+            "threshold_overrides": dict(self.threshold_overrides),
             "provenance": provenance_note(self.subshells_used),
         }

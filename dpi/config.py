@@ -14,12 +14,14 @@ than three minutes later inside a quadrature loop.
 from __future__ import annotations
 
 import difflib
+import math
 import os
 import tomllib
 from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
 
 from .amplitudes import TermSwitches
+from .atomic_sigma import THRESHOLD_MODELS
 from .constants import ConfigError
 
 Coupling = Literal["ls", "jj"]
@@ -94,9 +96,31 @@ class PhysicsConfig:
     one_centre_dipole: bool = True
     """Restrict the bound-to-bound dipole to one-centre origin-shifted blocks.
 
-    Required for consistency with the Gelius reduction (manuscript
-    Eq. 117); the full molecular dipole injects a large R_A <chi|chi>
-    positional term with no counterpart in the atomic cross sections.
+    Required for consistency with the Gelius reduction (notes Eq. 146);
+    the full molecular dipole injects a large R_A <chi|chi> positional
+    term with no counterpart in the atomic cross sections.
+    """
+
+    omega_over_omega_eff: bool = False
+    """Apply the residual ``omega / (eps1 + I_mu)`` weight to each AO.
+
+    Substituting a tabulated ``sigma^AO`` for the computed dipole matrix
+    element imports sigma's own normalisation.  Inverting its definition
+    (notes Eq. 93, via Eq. (99)) cancels the sDCS
+    prefactor's ``k_1`` and its ``1/3`` polarisation average exactly -- the
+    ``1/3`` of Eq. (94) appears once in each and no more
+    (Remark 3) -- and the ``k_2`` of the shake-off block is
+    electron 2's phase-space factor -- so ``4 pi^2 omega / 3c * k_1 k_2``
+    cancels *except* for one ratio: the prefactor carries the molecular
+    ``omega`` while sigma carries the per-AO ``omega_eff = eps1 + I_mu``.
+
+    Off by default because every spectrum computed before this option
+    existed omitted it, and the published SF6 band intensities were
+    validated in that convention.  Switching it on is not a rescaling: the
+    weight varies across the energy-sharing integral (1.01-1.11 for an F1s
+    AO but 8.8-42.8 for F2p at omega = 770 eV), so it changes the sharing
+    profile and the core-vs-valence balance.  See REVIEW.md [A-8] and
+    NORMALISATION.md.
     """
 
     include_frozen: bool = False
@@ -107,6 +131,101 @@ class PhysicsConfig:
     Keys look like ``"S_1s"``.  Yeh-Lindau stops at 1500 eV while the S1s
     edge is probed near 2610 eV, so that subshell rests on an
     extrapolation; -3.5 is the hydrogenic value.
+    """
+
+    anchor_delta_ev: float = 0.1
+    """Offset of the second artificial knot in the ``"anchored"`` model, eV.
+
+    Only used when ``threshold_model = "anchored"``.  It sets the width over
+    which ``sigma`` climbs from the imposed zero at ``I_mu`` to the value the
+    data extrapolates to, so it is physical content rather than a numerical
+    tolerance: as it goes to zero the model becomes a step, and as it
+    approaches the gap width it becomes a smooth rise across the whole gap.
+    The dependence is monotone and mild -- at the F1s edge the integrated
+    intensity moves from 1.02763 at 0.001 eV to 1.02649 at 0.1 (0.11% across
+    two decades) and 1.01688 at 1.0 eV -- so 0.1 is where a further tenfold
+    reduction changes the answer by about 0.1%.  REVIEW.md [A-17].
+    """
+
+    threshold_model: str = "linear"
+    """Shape of ``sigma^AO`` between ``I_mu`` and the first tabulated point.
+
+    ``"linear"`` (default), ``"flat"``, ``"coulomb"``, ``"wigner"``,
+    ``"extrapolate"`` or ``"anchored"``.  This
+    region is not tabulated data, and it is entered unavoidably whenever
+    ``omega_over_omega_eff`` is on, because ``omega_eff -> I_mu`` as the
+    sharing ``eps1 -> 0``: at the F1s edge it supplies 18% of the weighted
+    singlet intensity against 14% unweighted (REVIEW.md [A-12]).
+
+    The four are not equally defensible and the default is the *least* so:
+
+    * ``"linear"`` -- ``sigma_lo * (hv - I)/(hv_lo - I)``.  Vanishes at
+      threshold with slope 1, which no final-state potential produces.  Kept
+      as the default only because every spectrum computed before this option
+      existed used it.
+    * ``"coulomb"`` -- the exact hydrogenic (Stobbe) energy dependence,
+      rescaled to the tabulated magnitude at ``hv_lo``.  **This is the
+      physically correct family for a tabulated atomic cross section**: the
+      residual ion is charged, the Coulomb penetration factor cancels the
+      phase-space suppression, and ``sigma`` approaches a finite constant at
+      threshold rather than vanishing.  Consistent with the tabulated data,
+      whose first-two-point log-log slopes are flat (-0.02 for F1s, +0.00 for
+      S2s) rather than rising.
+    * ``"flat"`` -- ``sigma_lo`` held constant.  Crude, but it is the correct
+      *limit* of ``"coulomb"``, so the pair brackets the answer.
+    * ``"wigner"`` -- ``(hv - I)^(l' + 1/2)``, the threshold law for a
+      **short-range** final state.  Wrong for a tabulated atomic ``sigma``,
+      but right for the plane-wave continuum this model uses everywhere else,
+      so the mismatch is a real internal tension rather than an error to
+      pick a side on.  Offered to be quantified, not to be trusted.
+    * ``"extrapolate"`` -- no physics model at all: continue the log-log
+      spline itself backwards into the gap.  Assumes only the data's own
+      local shape, which makes it an *independent* check on ``"coulomb"``
+      rather than a rival: where they agree the near-threshold value is
+      corroborated by two unrelated arguments, and where they diverge the
+      group is flagged by ``unsafe_extrapolations``.  On the shipped table
+      they agree to 0.06% over the subshells carrying 94.6% of an F1s-edge
+      spectrum.  Unbounded when abused, so never use it alone over a long
+      lever arm.
+
+    * ``"anchored"`` -- the two-artificial-point construction.  Drop every
+      point at or below ``I_mu``; insert a knot at ``I_mu`` with
+      ``sigma = 0`` exactly, and a second at ``I_mu + anchor_delta_ev``
+      whose value comes from extrapolating the cleaned data; then
+      interpolate the union with a shape-preserving PCHIP in *linear*
+      ``sigma`` (``log 0`` is undefined, so this model cannot use the
+      log-log variable the others share).  It is the only model that
+      imposes ``sigma(I_mu) = 0`` while inheriting the *slope* leaving
+      threshold from the data rather than assuming one.
+
+    Sweep it (``--set physics.threshold_model=coulomb``) and quote the spread
+    as a systematic on the band intensities.  With the flagged groups left on
+    ``"linear"``, the three defensible models ``flat``/``coulomb``/
+    ``extrapolate`` span only 0.087% (F1s) and 0.047% (S1s); the full
+    five-model spread is 3.3% / 1.8%, but that is dominated by ``linear`` and
+    ``wigner``, both of which are known to be wrong for a Coulombic threshold.
+    The systematic to quote is the +2.7% / +1.4% shift of the defensible
+    cluster away from ``linear``.
+    """
+
+    threshold_override: dict[str, float] = field(default_factory=dict)
+    """Per-subshell ionization threshold ``I_mu`` in eV, overriding the table.
+
+    Keys look like ``"F_2p"``.  By default ``I_mu`` is the *free-atom*
+    threshold shipped with the Yeh-Lindau entry -- the choice consistent
+    with substituting a free-atom ``sigma`` -- and it is not derived from
+    the user's MOLCAS files at all.  That is a modelling assumption, not a
+    result, and it is worth being able to test: ``I_mu`` sets both where the
+    tabulated curve is read (``sigma_mu(eps1 + I_mu)``) and the denominator
+    of the ``omega_over_omega_eff`` weight, so an error in it does not
+    cancel between the two.  Measured sensitivity at the F1s edge is about
+    2% per eV near zero.
+
+    The natural use is to substitute molecular binding energies for the
+    valence subshells, whose free-atom values shift most on bonding, while
+    leaving the core alone.  Overriding does *not* move the tabulated
+    curve's own onset: ``sigma^AO`` stays a free-atom property.  See
+    REVIEW.md [A-13].
     """
 
     def __post_init__(self) -> None:
@@ -127,6 +246,26 @@ class PhysicsConfig:
                 f"[physics] coupling must be 'ls' (F1s, S1s edges) or 'jj' "
                 f"(S2p edge, spin-orbit split core hole), "
                 f"got {self.coupling!r}")
+        if not math.isfinite(self.anchor_delta_ev) or self.anchor_delta_ev <= 0.0:
+            raise ConfigError(
+                f"[physics] anchor_delta_ev must be positive and finite, got "
+                f"{self.anchor_delta_ev}. It is the offset of the second "
+                f"artificial knot above the threshold in the 'anchored' model."
+            )
+        if self.anchor_delta_ev > 1.0 and self.threshold_model == "anchored":
+            raise ConfigError(
+                f"[physics] anchor_delta_ev = {self.anchor_delta_ev} eV "
+                f"exceeds 1 eV, a sizeable fraction of the narrower gaps "
+                f"(S_2s's is 0.8 eV), so the second artificial knot would "
+                f"land past real data. Keep it <= 1.0; the integral is flat "
+                f"below ~0.1 eV (REVIEW.md [A-17])."
+            )
+        if self.threshold_model not in THRESHOLD_MODELS:
+            raise ConfigError(
+                f"[physics] threshold_model must be one of "
+                f"{list(THRESHOLD_MODELS)}, got {self.threshold_model!r}. "
+                f"'coulomb' is the physically correct family for a tabulated "
+                f"atomic cross section; 'linear' is the historical default.")
         if self.n_quad < 20:
             raise ConfigError(
                 f"[physics] n_quad = {self.n_quad} is too small for the "
@@ -300,6 +439,7 @@ class Config:
             f"quadrature points : {phys.n_quad}",
             f"terms included    : {', '.join(self.terms.active())}",
             f"one-centre dipole : {phys.one_centre_dipole}",
+            f"omega/omega_eff   : {phys.omega_over_omega_eff}",
             f"frozen reference  : {phys.include_frozen}",
             f"display onset     : {out.display_onset_ev:.4f} eV "
             f"(cosmetic x-axis shift only)",
@@ -315,6 +455,19 @@ class Config:
                 f"{k}:{v:+.2f}"
                 for k, v in sorted(phys.high_energy_exponent.items()))
             lines.append(f"sigma extrapolation: {pretty}")
+        if phys.threshold_model != "linear":
+            lines.append(
+                f"near-threshold sigma model: {phys.threshold_model}"
+                + (f" (delta = {phys.anchor_delta_ev} eV)"
+                   if phys.threshold_model == "anchored" else "")
+                + "  [non-default -- REVIEW.md A-14]")
+        if phys.threshold_override:
+            pretty = ", ".join(
+                f"{k}:{v:.2f}eV"
+                for k, v in sorted(phys.threshold_override.items()))
+            lines.append(
+                f"I_mu override: {pretty}"
+                f"  [free-atom thresholds replaced -- REVIEW.md A-13]")
         return lines
 
 
@@ -446,10 +599,17 @@ def load_config(path: str,
         spin_degeneracy_factor=float(
             phys_t.get("spin_degeneracy_factor", 1.0)),
         one_centre_dipole=bool(phys_t.get("one_centre_dipole", True)),
+        omega_over_omega_eff=bool(
+            phys_t.get("omega_over_omega_eff", False)),
         include_frozen=bool(phys_t.get("include_frozen", False)),
         high_energy_exponent={
             str(k): float(v)
             for k, v in dict(phys_t.get("high_energy_exponent", {})).items()},
+        threshold_model=str(phys_t.get("threshold_model", "linear")),
+        anchor_delta_ev=float(phys_t.get("anchor_delta_ev", 0.1)),
+        threshold_override={
+            str(k): float(v)
+            for k, v in dict(phys_t.get("threshold_override", {})).items()},
     )
 
     # `root` stands in for the string concatenation TOML cannot express.
@@ -499,6 +659,17 @@ def load_config(path: str,
     output = OutputConfig(**out_t)
     terms = build_term_switches(terms_t)
 
+    if physics.omega_over_omega_eff and terms.c_cross:
+        raise ConfigError(
+            "[physics] omega_over_omega_eff = true is not consistent with "
+            "[terms] c_cross = true. The C_ij term contracts sqrt(sigma_mu) "
+            "against the antisymmetric two-electron Dyson amplitude, so it "
+            "carries the omega/omega_eff weight only to the half power while "
+            "every other term carries it to the first; on the real SF6 files "
+            "this drives the triplet amplitude NEGATIVE (A_f < 0, which is "
+            "impossible for a squared amplitude). Set c_cross = false to use "
+            "the weight, or omega_over_omega_eff = false to keep C_ij. "
+            "See REVIEW.md [A-8] and [A-5].")
     if physics.spin_degeneracy_factor != 1.0 and physics.coupling == "jj":
         raise ConfigError(
             "[physics] spin_degeneracy_factor is an LS-coupling diagnostic; "
@@ -510,20 +681,60 @@ def load_config(path: str,
                   source=os.path.abspath(path))
 
 
+# Keys whose value is itself a table, so that a three-level override
+# "section.key.subkey" addresses an entry inside it rather than creating a
+# literal dotted key (which would then be rejected as unrecognised).
+_NESTED_KEYS = {
+    "physics": {"high_energy_exponent", "threshold_override"},
+    "paths": {"dication_orbitals", "energies", "frozen_energies",
+              "frozen_orbitals"},
+}
+
+
 def _apply_overrides(raw: dict[str, Any],
                      overrides: dict[str, Any]) -> dict[str, Any]:
-    """Apply flat ``"section.key" -> value`` overrides to a parsed table."""
+    """Apply ``"section.key"`` or ``"section.key.subkey"`` overrides.
+
+    The two-level form replaces a scalar setting.  The three-level form
+    addresses one entry of a table-valued key -- ``high_energy_exponent`` and
+    the per-channel path maps -- so that
+
+        --set physics.high_energy_exponent.S_1s=-3.0
+
+    sweeps a single subshell exponent while leaving the others in place.
+    Without this, that key would be stored literally as
+    ``"high_energy_exponent.S_1s"`` and then rejected by the unknown-key
+    check, which is what happened before this branch existed.
+    """
     out: dict[str, Any] = {k: (dict(v) if isinstance(v, dict) else v)
                            for k, v in raw.items()}
     for dotted, value in overrides.items():
         if value is None:
             continue
-        if "." not in dotted:
+        parts = dotted.split(".")
+        if len(parts) < 2:
             raise ConfigError(
-                f"override {dotted!r} must have the form 'section.key'.")
-        section, key = dotted.split(".", 1)
+                f"override {dotted!r} must have the form 'section.key' or "
+                f"'section.key.subkey'.")
+        section, key = parts[0], parts[1]
         if section not in _SECTIONS:
             raise ConfigError(
                 f"override {dotted!r} names unknown section {section!r}.")
-        out.setdefault(section, {})[key] = value
+        table = out.setdefault(section, {})
+        if len(parts) == 2:
+            table[key] = value
+            continue
+        if len(parts) > 3:
+            raise ConfigError(
+                f"override {dotted!r} is nested too deeply; at most "
+                f"'section.key.subkey' is supported.")
+        if key not in _NESTED_KEYS.get(section, frozenset()):
+            raise ConfigError(
+                f"override {dotted!r} addresses a sub-key of "
+                f"[{section}] {key}, but that key is not table-valued. "
+                f"Table-valued keys in [{section}]: "
+                f"{sorted(_NESTED_KEYS.get(section, ())) or 'none'}.")
+        inner = table.get(key)
+        table[key] = ({**inner} if isinstance(inner, dict) else {})
+        table[key][parts[2]] = value
     return out

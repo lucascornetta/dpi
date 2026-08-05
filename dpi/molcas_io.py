@@ -30,8 +30,8 @@ from __future__ import annotations
 import itertools
 import os
 import re
-from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from dataclasses import dataclass
+from typing import Iterable, Sequence
 
 import numpy as np
 
@@ -1339,7 +1339,7 @@ def read_ao_dipole(
 
     Notes
     -----
-    With ``one_centre=True`` this returns (manuscript Eq. 117)
+    With ``one_centre=True`` this returns (notes Eq. 146)
 
     .. code::
 
