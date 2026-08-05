@@ -780,7 +780,8 @@ def threshold(element: str, subshell: str) -> float:
 
 
 def sigma_region(
-    element: str, subshell: str, hv_ev: float | np.ndarray
+    element: str, subshell: str, hv_ev: float | np.ndarray,
+    threshold_model: str = "linear",
 ) -> np.ndarray:
     """Classify each photon energy into one of the four evaluation regions.
 
@@ -810,6 +811,22 @@ def sigma_region(
         REGION_LINEAR_RISE, codes,
     )
     codes = np.where(hv > ev.hv_hi, REGION_POWER_LAW, codes)
+
+    if threshold_model == "anchored":
+        # The anchored model owns a wider interval than the others: its step
+        # 1 discards the points at or below ``threshold_ev``, so for the two
+        # straddling entries (F 1s, S 2s) ``ev.hv_lo`` sits BELOW the
+        # threshold and the tests above find no modelled region at all.  The
+        # reclaim used to live only inside :func:`sigma`, which left this
+        # function -- and therefore ``SigmaBuilder.used_linear_rise`` and any
+        # diagnostic plot -- reporting no model use where the model was in
+        # fact active.  Classifying it here keeps the one definition of the
+        # region in one place.
+        first_real = _first_real_point(ev.data)
+        if first_real is not None:
+            reclaim = (hv > ev.data.threshold_ev) & (hv < first_real)
+            codes = np.where(reclaim, REGION_NEAR_THRESHOLD, codes)
+
     return codes
 
 
@@ -1029,21 +1046,7 @@ def sigma(
     hv = np.atleast_1d(hv_in)
     out = np.zeros(hv.shape, dtype=float)
 
-    codes = sigma_region(element, subshell, hv)
-
-    if threshold_model == "anchored":
-        # The anchored model owns a *wider* region than the others.  Step 1
-        # discards the points at or below ``threshold_ev``, so for the two
-        # straddling entries (F 1s, S 2s) the main spline's lower bound sits
-        # BELOW the threshold and ``sigma_region`` reports no near-threshold
-        # region at all -- the anchored knots would then never be consulted
-        # and the model would silently reduce to the plain spline.  Reclaim
-        # everything between the threshold and the first *surviving* real
-        # point, which is exactly the interval the artificial knots bridge.
-        first_real = _first_real_point(ev.data)
-        if first_real is not None:
-            reclaim = (hv > ev.data.threshold_ev) & (hv < first_real)
-            codes = np.where(reclaim, REGION_NEAR_THRESHOLD, codes)
+    codes = sigma_region(element, subshell, hv, threshold_model)
 
     rise = codes == REGION_NEAR_THRESHOLD
     if np.any(rise):
@@ -1437,7 +1440,8 @@ class SigmaBuilder:
                 anchor_delta_ev=self.anchor_delta_ev,
             )
             if np.any(
-                sigma_region(entry.element, entry.subshell, hv)
+                sigma_region(entry.element, entry.subshell, hv,
+                             self.threshold_model)
                 == REGION_LINEAR_RISE
             ):
                 self.used_linear_rise = True
