@@ -30,7 +30,7 @@ from __future__ import annotations
 import itertools
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -81,6 +81,25 @@ class OrbitalSet:
         The file the data came from, kept for error messages.
     version : str
         The declared format version, ``'2.0'`` or ``'2.2'``.
+    typeindex : str
+        The ``#INDEX`` type codes, one character per MO in file order
+        (``'i'`` inactive/doubly occupied, ``'1'``/``'2'``/``'3'`` RAS1/2/3
+        active, ``'s'`` secondary/virtual, ``'f'`` frozen, ``'d'``
+        deleted).  Empty when the file carries no ``#INDEX`` block.
+
+        This is the only place a **frozen-orbital** RasOrb records which
+        orbitals carry the holes: such a file is the neutral set with two
+        orbitals rotated to the front of the active space, so its ``#OCC``
+        is the *neutral* occupancy (summing to N, not N-2) and
+        :func:`rohf_hole_indices` cannot work on it.  See
+        :func:`frozen_hole_indices`.
+    energies : ndarray, shape (nmo,)
+        Orbital energies from ``#ONE``, hartree.  Empty array when the file
+        carries no ``#ONE`` block.  Read so that a hole assignment can be
+        *reported* with the depth of each orbital it names -- a core hole at
+        -26.39 Ha where -92.48 was intended is then visible on sight, which
+        no check on the amplitudes can achieve (in the frozen limit
+        ``det(S_beta) = 1`` whatever holes are named).
     """
 
     coeff: np.ndarray
@@ -89,6 +108,8 @@ class OrbitalSet:
     nmo_per_sym: tuple[int, ...]
     path: str
     version: str = "2.0"
+    typeindex: str = ""
+    energies: np.ndarray = field(default_factory=lambda: np.zeros(0))
 
     @property
     def nbas(self) -> int:
@@ -272,6 +293,11 @@ class SyntheticCase:
     inporb_neutral, inporb_dication, overlap, h5 : str
         Paths of the neutral ``INPORB``, the dication ``RasOrb``, the
         text overlap file and the HDF5 file.
+    inporb_frozen : str
+        Path of a **frozen-orbital** dication ``RasOrb``: the neutral
+        orbitals permuted so the two holes head the active space, with the
+        neutral occupancy in ``#OCC`` and the holes marked only in
+        ``#INDEX``.  This is the shape of a real unrelaxed MOLCAS file.
     nbas, nmo, n_neu_occ : int
         Basis size, orbital count and number of doubly occupied neutral
         spatial MOs.
@@ -304,6 +330,7 @@ class SyntheticCase:
     dirpath: str
     inporb_neutral: str
     inporb_dication: str
+    inporb_frozen: str
     overlap: str
     h5: str
     nbas: int
@@ -642,6 +669,42 @@ def read_inporb(path: str | os.PathLike) -> OrbitalSet:
                 f"outside [0, 2]"
             )
 
+    # #INDEX carries one type code per MO, in rows of ten preceded by the
+    # symmetry index:  "0 iiiiiiiiii".  Concatenating the code fields in
+    # order reproduces the per-MO string.  A frozen-orbital file needs this
+    # because its #OCC is the neutral occupancy and carries no hole.
+    energies = np.zeros(0)
+    if "#ONE" in blocks:
+        evals: list[float] = []
+        for lineno, raw in blocks["#ONE"]:
+            s = raw.strip()
+            if not s or s.startswith("*"):
+                continue
+            evals.extend(_to_float(tok, p, lineno) for tok in s.split())
+        if len(evals) == nmo:
+            energies = np.asarray(evals, dtype=float)
+        # A short or over-long #ONE is not fatal: the energies are used for
+        # reporting only, never in the physics, so a malformed block should
+        # not stop a run that would otherwise succeed.
+
+    typeindex = ""
+    if "#INDEX" in blocks:
+        parts: list[str] = []
+        for lineno, raw in blocks["#INDEX"]:
+            s = raw.strip()
+            if not s or s.startswith("*"):
+                continue
+            fields = s.split()
+            # Rows are "<isym> <codes>"; some writers omit the space.
+            parts.append(fields[1] if len(fields) > 1 else fields[0].lstrip(
+                "0123456789"))
+        typeindex = "".join(parts)
+        if typeindex and len(typeindex) != nmo:
+            raise MolcasFormatError(
+                f"{p}: #INDEX carries {len(typeindex)} type codes, "
+                f"expected nmo={nmo}"
+            )
+
     return OrbitalSet(
         coeff=coeff,
         occ=occ,
@@ -649,6 +712,214 @@ def read_inporb(path: str | os.PathLike) -> OrbitalSet:
         nmo_per_sym=tuple(int(v) for v in nmo_per_sym),
         path=p,
         version=version,
+        typeindex=typeindex,
+        energies=energies,
+    )
+
+
+def frozen_hole_indices(
+    frozen: OrbitalSet,
+    neutral: OrbitalSet,
+    s_ao: np.ndarray,
+    n_neu_occ: int,
+    active_mos: Sequence[int] | None = None,
+    expect_holes: Sequence[int] | None = None,
+    tol: float = 1e-6,
+) -> HoleAssignment:
+    """Hole assignment of a **frozen-orbital** dication RasOrb.
+
+    A frozen-orbital calculation does not relax the orbitals: MOLCAS writes
+    the neutral set back out with the two hole orbitals rotated into the
+    active space.  Two consequences make :func:`rohf_hole_indices`
+    inapplicable, and both were verified on a real SF6 S1s file:
+
+    * ``#OCC`` is the **neutral** occupancy -- every occupied MO at 2.0,
+      summing to ``N``, not ``N-2``.  ``rohf_hole_indices`` correctly
+      refuses it ("occupations sum to 70 electrons but a dication ... must
+      carry 68").  The occupations simply do not encode the holes.
+    * The coefficient matrix is the neutral one up to a **signed
+      permutation**: on the shipped file the overlap
+      ``C_frozen^T S C_neutral`` has peak magnitude 1.0000000000 and
+      off-peak norm 0.000e+00 in every row.
+
+    So the hole identity lives only in ``#INDEX``, whose active codes
+    (``1``/``2``/``3``) mark the two hole orbitals *in the frozen file's own
+    ordering*.  This function reads them and maps each back to the
+    corresponding **neutral** MO index through the overlap, because that is
+    the index the Dyson layer works in.
+
+    Parameters
+    ----------
+    frozen : OrbitalSet
+        The frozen-orbital dication file.
+    neutral : OrbitalSet
+        The neutral reference the frozen set was built from.
+    s_ao : ndarray, shape (nbas, nbas)
+        AO overlap, dimensionless.
+    n_neu_occ : int
+        ``n``, the number of doubly occupied neutral spatial MOs.
+    active_mos : sequence of int, optional
+        **1-based** positions of the active (C and V) orbitals in the frozen
+        file, i.e. the calculation's own convention -- ``(34, 35)`` for the
+        SF6 S1s and F1s edges, ``(32, 33, 34, 35)`` for S2p, where the three
+        degenerate cartesian S 2p projections are all active.  When given,
+        this is the authority and ``#INDEX`` becomes a **cross-check**: a
+        disagreement raises, since it means either the convention or the
+        file is wrong.  When omitted, ``#INDEX`` is used alone.
+    expect_holes : sequence of int, optional
+        **1-based neutral** MO indices the caller expects this state's holes
+        to be, as a cross-check.  The holes are still resolved from the file
+        exactly as without it; a mismatch raises.  This is deliberately not
+        an input to the assignment -- supplying the holes directly would
+        mean the coefficients are never inspected, and with them the signed
+        permutation check that stops a *relaxed* file being computed as
+        frozen.  Note the index space: these are neutral MO numbers, which
+        on the shipped SF6 S1s file are ``(1, 33)`` where the file positions
+        are ``(34, 35)``.
+    tol : float, optional
+        How far the frozen-to-neutral overlap may fall short of a signed
+        permutation before the file is rejected.  The default is tight on
+        purpose: a file that is *not* a permutation of the neutral set is
+        not a frozen-orbital calculation, and treating it as one would
+        silently report relaxed physics as the frozen limit.
+
+    Returns
+    -------
+    HoleAssignment
+        With ``hole_i`` and ``hole_j`` as **neutral** MO indices,
+        ``hole_i < hole_j``.  ``hole_i`` is therefore the core hole: a
+        neutral RHF set is energy-ordered, so the deeper orbital carries the
+        lower index.
+
+    Raises
+    ------
+    MolcasFormatError
+        If neither ``#INDEX`` nor ``active_mos`` is available, the two
+        disagree, fewer than two actives are marked, an active maps to an
+        unoccupied neutral orbital, or the coefficients are not a signed
+        permutation of the neutral set to within ``tol``.
+
+    Notes
+    -----
+    With more than two actives (the S2p case: three degenerate cartesian
+    core projections plus one valence) a CV pair takes the deepest and the
+    shallowest.  Which of the three cores is picked is immaterial -- see the
+    measurement in the source.
+    """
+    from_index = [k for k, c in enumerate(frozen.typeindex) if c in "123"]
+    if active_mos is not None:
+        active = sorted(int(m) - 1 for m in active_mos)
+        if any(a < 0 or a >= frozen.nmo for a in active):
+            raise MolcasFormatError(
+                f"{frozen.path}: frozen_active_mos "
+                f"{tuple(int(m) for m in active_mos)} is out of range for a "
+                f"file with {frozen.nmo} orbitals (positions are 1-based)"
+            )
+        # #INDEX is free corroboration when present.  Disagreement means the
+        # convention does not describe this file -- e.g. an S2p list applied
+        # to an S1s run -- and silently trusting either one would assign the
+        # holes to the wrong orbitals.
+        if from_index and from_index != active:
+            raise MolcasFormatError(
+                f"{frozen.path}: frozen_active_mos says the active orbitals "
+                f"are {tuple(a + 1 for a in active)} but #INDEX marks "
+                f"{tuple(a + 1 for a in from_index)}.  One of the two is "
+                f"wrong for this file; fix the convention or the orbitals "
+                f"rather than trusting either"
+            )
+    elif from_index:
+        active = from_index
+    else:
+        raise MolcasFormatError(
+            f"{frozen.path}: no #INDEX block and no frozen_active_mos given, "
+            f"so the hole orbitals cannot be identified.  A frozen-orbital "
+            f"file carries the NEUTRAL occupancy in #OCC, so one of the two "
+            f"is required"
+        )
+    if len(active) < 2:
+        raise MolcasFormatError(
+            f"{frozen.path}: {len(active)} active orbital "
+            f"{tuple(a + 1 for a in active)}; a core-valence dication needs "
+            f"at least 2 (one core hole, one valence hole)"
+        )
+    if frozen.coeff.shape != neutral.coeff.shape:
+        raise MolcasFormatError(
+            f"{frozen.path}: {frozen.coeff.shape} coefficients against "
+            f"{neutral.coeff.shape} for the neutral set; the two must come "
+            f"from the same basis"
+        )
+
+    # <phi^frozen_p | phi^neutral_q>.  For a genuine frozen calculation this
+    # is a signed permutation matrix.
+    q = frozen.coeff.T @ np.asarray(s_ao, dtype=float) @ neutral.coeff
+    mag = np.abs(q)
+    peak = mag.max(axis=1)
+    mapping = np.argmax(mag, axis=1)
+    off = np.sqrt(np.maximum((mag ** 2).sum(axis=1) - peak ** 2, 0.0))
+    worst = int(np.argmax(off))
+    if off[worst] > tol or abs(peak[worst] - 1.0) > tol:
+        raise MolcasFormatError(
+            f"{frozen.path}: the orbitals are NOT a signed permutation of "
+            f"the neutral set (MO {worst + 1} has peak overlap "
+            f"{peak[worst]:.6f} and off-peak norm {off[worst]:.3e}, "
+            f"tolerance {tol:g}), so this is not a frozen-orbital "
+            f"calculation.  Pass it as a relaxed dication file instead"
+        )
+    if len(set(mapping.tolist())) != mapping.size:
+        raise MolcasFormatError(
+            f"{frozen.path}: the frozen-to-neutral orbital map is not a "
+            f"bijection, so the #INDEX holes cannot be resolved uniquely"
+        )
+
+    holes = sorted(int(mapping[a]) for a in active)
+    if any(h >= n_neu_occ for h in holes):
+        raise MolcasFormatError(
+            f"{frozen.path}: the active orbitals map to neutral MOs "
+            f"{tuple(h + 1 for h in holes)}, but only the first "
+            f"{n_neu_occ} are occupied in the neutral; a hole must be in an "
+            f"occupied orbital"
+        )
+
+    if len(holes) > 2:
+        # The S2p case: three degenerate cartesian core projections are all
+        # active, so the active set holds 3 cores + 1 valence and a CV pair
+        # must take one of each.  Which core is chosen does not matter --
+        # measured on the SF6 neutral set, moving the core hole through the
+        # three S 2p MOs changes the integrated singlet intensity by
+        # 1.6e-14 absolute (2.4e-15 relative), i.e. they are numerically
+        # identical.  The deepest is taken for definiteness.
+        #
+        # Core and valence are separated by ORBITAL DEPTH, not by position
+        # in the active list: on the shipped S1s file the core sits at
+        # frozen position 35 and the valence at 34, the reverse of the "C
+        # and V" naming order.  Ordering by neutral MO index is safe because
+        # a neutral RHF set is energy-ordered, so a core hole always carries
+        # the lower index.
+        hole_i, hole_j = holes[0], holes[-1]
+    else:
+        hole_i, hole_j = holes
+
+    if expect_holes is not None:
+        want = tuple(sorted(int(m) - 1 for m in expect_holes))
+        if want != (hole_i, hole_j):
+            raise MolcasFormatError(
+                f"{frozen.path}: the file resolves to neutral holes "
+                f"{(hole_i + 1, hole_j + 1)} but expect_holes says "
+                f"{tuple(w + 1 for w in want)}.  The holes are read from the "
+                f"file, so this means the expectation is wrong for this "
+                f"state, the states are paired in a different order than "
+                f"assumed, or the wrong file is listed"
+            )
+    alpha_idx = tuple(k for k in range(n_neu_occ) if k != hole_i)
+    beta_idx = tuple(k for k in range(n_neu_occ) if k != hole_j)
+    return HoleAssignment(
+        alpha_idx=alpha_idx,
+        beta_idx=beta_idx,
+        n_doubly=n_neu_occ - 2,
+        n_singly=2,
+        hole_i=hole_i,
+        hole_j=hole_j,
+        approximation=None,
     )
 
 
@@ -1414,7 +1685,8 @@ def _write_block(fh, values: Sequence[float], fmt: str,
 
 def _write_inporb(
     path: str, coeff: np.ndarray, occ: np.ndarray | None, version: str,
-    title: str,
+    title: str, typeindex: str | None = None,
+    energies: np.ndarray | None = None,
 ) -> None:
     """Write a single-symmetry INPORB 2.0 or 2.2 file.
 
@@ -1441,9 +1713,25 @@ def _write_inporb(
             fh.write("#OCC\n")
             fh.write("* OCCUPATION NUMBERS\n")
             _write_block(fh, list(occ), _INPORB_FMT, 5)
+        if energies is not None:
+            # Real ScfOrb files carry #ONE, and the frozen hole report reads
+            # it to print how deep each holed orbital is.  The fixture writes
+            # it so the demo exercises that path rather than silently taking
+            # the no-energies branch.
+            fh.write("#ONE\n")
+            fh.write("* ONE ELECTRON ENERGIES\n")
+            _write_block(fh, list(energies), _INPORB_FMT, 5)
         fh.write("#INDEX\n")
         fh.write("* 1234567890\n")
-        if occ is None:
+        if typeindex is not None:
+            # An explicit type index is how a FROZEN-orbital file records its
+            # holes: its #OCC is the neutral occupancy, so the codes cannot
+            # be derived from it.
+            if len(typeindex) != nmo:
+                raise ValueError(
+                    f"typeindex has {len(typeindex)} codes for {nmo} orbitals")
+            types = typeindex
+        elif occ is None:
             types = "i" * nmo
         else:
             types = "".join(
@@ -1639,8 +1927,13 @@ def write_synthetic_case(
     ovl_path = os.path.join(d, "ao_overlap.txt")
     h5_path = os.path.join(d, "case.h5")
 
+    # A descending, core-like energy ladder: the two deepest orbitals are far
+    # below the rest, so the frozen hole report has something meaningful to
+    # print and a test can assert that a core hole reads as deep.
+    ene_neu = np.array([-90.0, -25.0] + [-1.0 - 0.1 * k
+                                         for k in range(nmo - 2)])
     _write_inporb(inporb_neu, c_neu, occ_neu, version_neutral,
-                  "synthetic neutral RHF orbitals")
+                  "synthetic neutral RHF orbitals", energies=ene_neu)
     _write_inporb(inporb_dic, c_dic, occ_dic, version_dication,
                   "synthetic dication OSRHF orbitals")
 
@@ -1716,10 +2009,31 @@ def write_synthetic_case(
         fh.create_dataset("MO_VECTORS", data=c_neu.T.reshape(-1).copy())
         fh.create_dataset("MO_OCCUPATIONS", data=occ_neu.copy())
 
+    # A FROZEN-orbital dication file: the neutral orbitals with the two hole
+    # orbitals moved to the front of the active space, carrying the NEUTRAL
+    # occupancy.  This is what MOLCAS writes for an unrelaxed calculation, and
+    # it is the case `frozen_hole_indices` must handle -- a permutation of the
+    # neutral set whose holes live only in #INDEX.  Permuting (rather than
+    # merely relabelling) is the point: it makes the fixture exercise the
+    # frozen-to-neutral mapping instead of assuming the identity.
+    order = [h_i, h_j] + [k for k in range(nmo) if k not in (h_i, h_j)]
+    c_frozen = c_neu[:, order]
+    codes = ["i"] * nmo
+    codes[0] = "1"
+    codes[1] = "3"
+    for pos, orig in enumerate(order):
+        if orig >= n_neu_occ:
+            codes[pos] = "s"
+    inporb_frz = os.path.join(d, "frozen.RasOrb")
+    _write_inporb(inporb_frz, c_frozen, occ_neu[order], version_dication,
+                  "SYNTHETIC frozen-orbital dication",
+                  typeindex="".join(codes))
+
     return SyntheticCase(
         dirpath=d,
         inporb_neutral=inporb_neu,
         inporb_dication=inporb_dic,
+        inporb_frozen=inporb_frz,
         overlap=ovl_path,
         h5=h5_path,
         nbas=nbas,

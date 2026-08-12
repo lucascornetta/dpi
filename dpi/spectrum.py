@@ -153,6 +153,16 @@ class QuadratureGrid:
     e_excess_au: float
 
     @property
+    def k1_au(self) -> np.ndarray:
+        """``(nq,)`` FAST-electron momentum, a.u. -- the mirror of ``k2_au``.
+
+        ``k2_au`` is the slow electron's momentum, which the shake-off weight
+        is evaluated at in the assignment where the *fast* electron absorbs
+        the photon.  The exchange partner needs the other assignment.
+        """
+        return np.sqrt(2.0 * ev_to_au(self.eps1_ev))
+
+    @property
     def measure_au(self) -> np.ndarray:
         """``(nq,)`` combined weight ``w_q * d(eps2)/dt``, a.u."""
         return self.weights * self.jacobian_au
@@ -326,7 +336,7 @@ def _resolve_pshake(cfg: Any) -> Callable[[np.ndarray], np.ndarray]:
 
 
 def build_grid_inputs(
-    cfg: Any, grid: QuadratureGrid
+    cfg: Any, grid: QuadratureGrid, swap: bool = False
 ) -> tuple[np.ndarray, np.ndarray]:
     """Evaluate ``sigma`` and ``P^shake`` on the whole quadrature grid.
 
@@ -348,6 +358,12 @@ def build_grid_inputs(
     """
     sigma_grid = np.asarray(_resolve_sigma(cfg)(grid.eps1_ev), dtype=float)
     pshake_grid = np.asarray(_resolve_pshake(cfg)(grid.k2_au), dtype=float)
+    if swap:
+        # The MIRROR assignment: sigma at eps2, the shake-off weight at eps1,
+        # i.e. the slow electron absorbs the photon and the fast one is
+        # shaken off.  REVIEW.md [A-19].
+        sigma_grid = np.asarray(_resolve_sigma(cfg)(grid.eps2_ev), dtype=float)
+        pshake_grid = np.asarray(_resolve_pshake(cfg)(grid.k1_au), dtype=float)
     nq = grid.t.size
     for name, arr in (("sigma_grid", sigma_grid),
                       ("pshake_grid", pshake_grid)):
@@ -497,15 +513,34 @@ def integrate_state(
     sigma_grid, pshake_grid = build_grid_inputs(cfg, grid)
     blk = amp.build_blocks(dyson, sigma_grid, pshake_grid, grid.k2_au, terms)
 
+    # ── energy-sharing (exchange) symmetry ─────────────────────────────────
+    # The two photoelectrons are identical, so A_f(eps1) must equal
+    # A_f(E_excess - eps1).  One block evaluation reads sigma at eps1 and the
+    # shake-off weight at eps2, encoding only "fast electron absorbs, slow one
+    # is shaken"; the exchange partner is an equally allowed route to the same
+    # final state.  Measured on SF6 S1s CV state 1: a single evaluation is
+    # asymmetric by 98.7% of its own peak, the mean by 1e-14, and the two are
+    # exact mirror images so the integral is unchanged.  REVIEW.md [A-19].
+    if getattr(terms, "sharing_symmetry", True):
+        sigma_sw, pshake_sw = build_grid_inputs(cfg, grid, swap=True)
+        blk_sw = amp.build_blocks(dyson, sigma_sw, pshake_sw, grid.k1_au,
+                                  terms)
+    else:
+        blk_sw = None
+
     # A jj-coupled peak is A(S=0) + A(S=1), and those two LS amplitudes
     # belong to different dication states with different relaxed orbitals.
     # `dyson` carries the S=0 set and `dyson_triplet` the S=1 set; both are
     # projected onto the SAME quadrature grid, which is why the second
     # Blocks is built here rather than by the caller.
     blk_t = None
+    blk_t_sw = None
     if dyson_triplet is not None:
         blk_t = amp.build_blocks(dyson_triplet, sigma_grid, pshake_grid,
                                  grid.k2_au, terms)
+        if blk_sw is not None:
+            blk_t_sw = amp.build_blocks(dyson_triplet, sigma_sw, pshake_sw,
+                                        grid.k1_au, terms)
     elif channel in ("jc32", "jc12"):
         raise ModelError(
             f"spectrum.integrate_state: channel {channel!r} needs both the "
@@ -517,11 +552,18 @@ def integrate_state(
     pre = prefactor(omega_ev)
 
     breakdown = amp.term_breakdown(blk, channel, terms, blk_t)
+    a_total = amp.amplitude(blk, channel, terms, blk_t)
+    if blk_sw is not None:
+        # Arithmetic MEAN, not sum: the two assignments are the same physical
+        # pathway under the two labellings of an indistinguishable pair.
+        sw = amp.term_breakdown(blk_sw, channel, terms, blk_t_sw)
+        breakdown = {k: 0.5 * (v + sw[k]) for k, v in breakdown.items()}
+        a_total = 0.5 * (a_total
+                         + amp.amplitude(blk_sw, channel, terms, blk_t_sw))
     term_integrals = {
         name: float(pre * np.dot(measure, arr))
         for name, arr in breakdown.items()
     }
-    a_total = amp.amplitude(blk, channel, terms, blk_t)
     intensity = float(pre * np.dot(measure, a_total))
 
     return StateResult(

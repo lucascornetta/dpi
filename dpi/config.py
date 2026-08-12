@@ -124,6 +124,35 @@ class PhysicsConfig:
     """
 
     include_frozen: bool = False
+    #: 1-based positions of the active (C and V) orbitals in a
+    #: frozen-orbital ``.RasOrb``, i.e. the calculation's own convention:
+    #: ``[34, 35]`` for the SF6 S1s and F1s edges, ``[32, 33, 34, 35]`` for
+    #: S2p, where all three degenerate cartesian S 2p projections are
+    #: active.  A frozen file carries the NEUTRAL occupancy in ``#OCC`` and
+    #: so cannot be read by occupation; when this is given it is the
+    #: authority and ``#INDEX`` is used as a cross-check, with a
+    #: disagreement raising rather than silently trusting either.  Leave
+    #: empty to rely on ``#INDEX`` alone.
+    frozen_active_mos: tuple[int, ...] = ()
+    #: Optional per-state cross-check on the frozen hole assignment, keyed by
+    #: channel then by 1-based state index:
+    #:
+    #:     [physics.frozen_expect_holes.singlet]
+    #:     1 = [1, 33]
+    #:
+    #: The values are **neutral** MO numbers (1-based) -- not positions in
+    #: the frozen file, which differ: on the shipped SF6 S1s file the holes
+    #: are neutral MOs (1, 33) while the file positions are (34, 35).
+    #:
+    #: This never feeds the assignment.  The holes are always resolved from
+    #: the orbital file, and a listed state whose resolved holes disagree
+    #: raises.  Supplying holes directly instead would skip reading the
+    #: coefficients, and with them the signed-permutation check that stops a
+    #: relaxed file being computed as frozen; a wrong hole is otherwise
+    #: silent, since det(S_beta) = 1 in the frozen limit whatever holes are
+    #: named.  States not listed are simply not checked.
+    frozen_expect_holes: dict[str, dict[int, tuple[int, ...]]] = field(
+        default_factory=dict)
 
     high_energy_exponent: dict[str, float] = field(default_factory=dict)
     """Per-subshell power-law exponent above the tabulated range.
@@ -241,6 +270,57 @@ class PhysicsConfig:
                 f"[physics] photon_energy_ev ({self.photon_energy_ev} eV) "
                 f"must exceed true_dip_ev ({self.true_dip_ev} eV): otherwise "
                 f"E_excess <= 0 and no channel is open.")
+        if self.frozen_active_mos:
+            mos = self.frozen_active_mos
+            if len(set(mos)) != len(mos):
+                raise ConfigError(
+                    f"[physics] frozen_active_mos {mos} repeats an orbital; "
+                    f"each active MO must appear once")
+            if any(m < 1 for m in mos):
+                raise ConfigError(
+                    f"[physics] frozen_active_mos {mos} contains a "
+                    f"non-positive index; positions are 1-based as written "
+                    f"in the RasOrb file")
+            if len(mos) < 2:
+                raise ConfigError(
+                    f"[physics] frozen_active_mos {mos} lists {len(mos)} "
+                    f"orbital(s); a core-valence dication needs at least 2 "
+                    f"(one core, one valence)")
+        for channel, rows in self.frozen_expect_holes.items():
+            for index, holes in rows.items():
+                if index < 1:
+                    raise ConfigError(
+                        f"[physics.frozen_expect_holes.{channel}] state "
+                        f"index {index} is not positive; state indices are "
+                        f"1-based, matching the energy-list line numbers")
+                if len(holes) != 2:
+                    raise ConfigError(
+                        f"[physics.frozen_expect_holes.{channel}] state "
+                        f"{index} lists {len(holes)} orbital(s) {holes}; a "
+                        f"core-valence hole pair is exactly 2 neutral MO "
+                        f"numbers")
+                if len(set(holes)) != 2:
+                    raise ConfigError(
+                        f"[physics.frozen_expect_holes.{channel}] state "
+                        f"{index} repeats orbital {holes[0]}; the two holes "
+                        f"must be different orbitals")
+                if any(h < 1 for h in holes):
+                    raise ConfigError(
+                        f"[physics.frozen_expect_holes.{channel}] state "
+                        f"{index} contains a non-positive orbital in "
+                        f"{holes}; these are 1-based NEUTRAL MO numbers")
+                if any(h > self.n_neu_occ for h in holes):
+                    raise ConfigError(
+                        f"[physics.frozen_expect_holes.{channel}] state "
+                        f"{index} names orbital(s) above n_neu_occ="
+                        f"{self.n_neu_occ} in {holes}; a hole must be in an "
+                        f"occupied neutral orbital.  Note these are NEUTRAL "
+                        f"MO numbers, not positions in the frozen file")
+        if self.frozen_expect_holes and not self.include_frozen:
+            raise ConfigError(
+                "[physics] frozen_expect_holes is set but include_frozen is "
+                "false, so nothing would be checked.  Enable the frozen "
+                "limit or remove the expectation table.")
         if self.coupling not in ("ls", "jj"):
             raise ConfigError(
                 f"[physics] coupling must be 'ls' (F1s, S1s edges) or 'jj' "
@@ -440,7 +520,15 @@ class Config:
             f"terms included    : {', '.join(self.terms.active())}",
             f"one-centre dipole : {phys.one_centre_dipole}",
             f"omega/omega_eff   : {phys.omega_over_omega_eff}",
-            f"frozen reference  : {phys.include_frozen}",
+            f"frozen reference  : {phys.include_frozen}"
+            + (f"  [active MOs {phys.frozen_active_mos}]"
+               if phys.include_frozen and phys.frozen_active_mos else "")
+            + (f"  [{sum(len(r) for r in phys.frozen_expect_holes.values())}"
+               f" state(s) hole-checked]"
+               if phys.include_frozen and phys.frozen_expect_holes else "")
+            + ("  [own energies + own orbitals; reported separately, "
+               "never summed with the relaxed result]"
+               if phys.include_frozen else ""),
             f"display onset     : {out.display_onset_ev:.4f} eV "
             f"(cosmetic x-axis shift only)",
             f"Voigt sigma/gamma : {out.voigt_sigma_ev:.4f} / "
@@ -483,6 +571,60 @@ def _require(table: dict[str, Any], key: str, section: str) -> Any:
     if key not in table:
         raise ConfigError(f"[{section}] is missing the required key {key!r}.")
     return table[key]
+
+
+def _expect_holes_table(raw: Any) -> dict[str, dict[int, tuple[int, ...]]]:
+    """Parse ``[physics.frozen_expect_holes]`` with legible errors.
+
+    The shape is channel -> state index -> two neutral MO numbers::
+
+        [physics.frozen_expect_holes.singlet]
+        1 = [1, 33]
+
+    Written by hand and easy to get slightly wrong, so every level reports
+    what it found rather than letting a bare ``dict()`` raise
+    ``dictionary update sequence element #0 has length 1``, which says
+    nothing about which channel or state is at fault.
+    """
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"[physics] frozen_expect_holes must be a table of "
+            f"channel -> state -> [core_mo, valence_mo], got "
+            f"{type(raw).__name__}")
+    out: dict[str, dict[int, tuple[int, ...]]] = {}
+    for channel, rows in raw.items():
+        if not isinstance(rows, dict):
+            raise ConfigError(
+                f"[physics.frozen_expect_holes] channel {channel!r} must map "
+                f"state indices to hole pairs, e.g. "
+                f"`[physics.frozen_expect_holes.{channel}]` with `1 = "
+                f"[1, 33]`; got {type(rows).__name__}")
+        parsed: dict[int, tuple[int, ...]] = {}
+        for key, vals in rows.items():
+            try:
+                index = int(key)
+            except (TypeError, ValueError):
+                raise ConfigError(
+                    f"[physics.frozen_expect_holes.{channel}] key {key!r} is "
+                    f"not a state index; keys are the 1-based line numbers "
+                    f"of the frozen energy list") from None
+            if isinstance(vals, (str, bytes)) or not isinstance(
+                    vals, (list, tuple)):
+                raise ConfigError(
+                    f"[physics.frozen_expect_holes.{channel}] state {index} "
+                    f"must be a list of two NEUTRAL MO numbers, e.g. "
+                    f"[1, 33]; got {vals!r}")
+            try:
+                parsed[index] = tuple(int(v) for v in vals)
+            except (TypeError, ValueError):
+                raise ConfigError(
+                    f"[physics.frozen_expect_holes.{channel}] state {index} "
+                    f"contains a non-integer orbital in {list(vals)!r}") \
+                    from None
+        out[str(channel)] = parsed
+    return out
 
 
 def _reject_unknown(table: dict[str, Any], allowed: set[str],
@@ -602,6 +744,10 @@ def load_config(path: str,
         omega_over_omega_eff=bool(
             phys_t.get("omega_over_omega_eff", False)),
         include_frozen=bool(phys_t.get("include_frozen", False)),
+        frozen_active_mos=tuple(
+            int(v) for v in phys_t.get("frozen_active_mos", ())),
+        frozen_expect_holes=_expect_holes_table(
+            phys_t.get("frozen_expect_holes", {})),
         high_energy_exponent={
             str(k): float(v)
             for k, v in dict(phys_t.get("high_energy_exponent", {})).items()},
@@ -645,9 +791,13 @@ def load_config(path: str,
         frozen_energies=_join_map(
             _channel_map(paths_t, "frozen_energies", channels, "paths",
                          required=physics.include_frozen)),
+        # Required whenever the frozen limit is on: the frozen .RasOrb files
+        # are the ONLY record of which orbitals carry the holes in that
+        # calculation (its #OCC is the neutral occupancy) and of its own
+        # state ordering, which need not match the relaxed one.
         frozen_orbitals=_join_map(
             _channel_map(paths_t, "frozen_orbitals", orbital_keys, "paths",
-                         required=False)),
+                         required=physics.include_frozen)),
         experiment=(_join(paths_t["experiment"])
                     if paths_t.get("experiment") else None),
         # cache_dir is an OUTPUT directory, so it is deliberately not
@@ -685,7 +835,8 @@ def load_config(path: str,
 # "section.key.subkey" addresses an entry inside it rather than creating a
 # literal dotted key (which would then be rejected as unrecognised).
 _NESTED_KEYS = {
-    "physics": {"high_energy_exponent", "threshold_override"},
+    "physics": {"high_energy_exponent", "threshold_override",
+                "frozen_expect_holes"},
     "paths": {"dication_orbitals", "energies", "frozen_energies",
               "frozen_orbitals"},
 }

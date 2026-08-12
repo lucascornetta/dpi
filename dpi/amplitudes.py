@@ -134,6 +134,22 @@ class TermSwitches:
     aa_bb: bool = True
     dir_ind_interference: bool = False
     c_cross: bool = True
+    sharing_symmetry: bool = True
+    """Symmetrise ``A_f`` under ``eps1 <-> E_excess - eps1``.
+
+    The two photoelectrons are identical, so ``A_f(eps1) =
+    A_f(E_excess - eps1)`` is required, not optional.  A single block
+    evaluation reads ``sigma`` at ``eps1`` and the shake-off weight at
+    ``eps2``, encoding one assignment only (fast electron absorbs, slow one
+    is shaken); ``spectrum.integrate_state`` averages that with the exchange
+    partner.
+
+    Leave this on.  It is a switch only so the asymmetric result can be
+    reproduced for comparison -- turning it off changes no integrated
+    intensity, since the two halves are exact mirror images, but it makes the
+    differential ``A_f(eps1)`` unphysical.  See REVIEW.md [A-19].
+    """
+
     dir_ind_sign: float = 1.0
     spin_degeneracy_factor: float = 1.0
 

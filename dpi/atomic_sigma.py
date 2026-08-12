@@ -1158,9 +1158,22 @@ class SigmaBuilder:
         threshold_overrides: Mapping[str, float] | None = None,
         threshold_model: str = "linear",
         anchor_delta_ev: float = ANCHOR_DELTA_EV,
+        photon_energy_ev: float | None = None,
     ) -> None:
         self.basis = basis
         self.anchor_delta_ev = float(anchor_delta_ev)
+        #: Table keys zeroed because ``I_mu`` exceeded the photon energy on
+        #: some call to :meth:`at_eps1_grid`.  A closed subshell is usually a
+        #: sign that the photon energy and the state list belong to different
+        #: edges.
+        self.closed_subshells: set[str] = set()
+        #: Photon energy in eV, when known.  Kept SEPARATE from the
+        #: ``omega_ev`` argument of :meth:`at_eps1_grid`, which is the switch
+        #: for the ``omega/omega_eff`` weight: energy conservation is not
+        #: optional and must hold whether or not that weight is applied.
+        #: ``None`` disables the check, for callers with no photon energy.
+        self.omega_ev: float | None = (
+            None if photon_energy_ev is None else float(photon_energy_ev))
         self.subshell_map = (
             DEFAULT_SUBSHELL_MAP if subshell_map is None
             else {k: dict(v) for k, v in subshell_map.items()}
@@ -1445,6 +1458,24 @@ class SigmaBuilder:
                 == REGION_LINEAR_RISE
             ):
                 self.used_linear_rise = True
+            if self.omega_ev is not None and float(
+                    self.omega_ev) < entry.threshold_ev:
+                # ENERGY CONSERVATION against the real photon.  sigma is read
+                # at hv = eps1 + I_mu, which is >= I_mu by construction, so
+                # without this test every subshell looks open however small
+                # omega is: an AO whose threshold exceeds the photon energy
+                # still receives the cross section it would have at its OWN
+                # onset.  The physical value is exactly zero -- the photon
+                # cannot ionise that subshell at all.
+                #
+                # The symptom is visible in the weight: omega/omega_eff(mu)
+                # < 1 requires omega < eps1 + I_mu, and since eps1 >= 0 the
+                # only way that can hold across the whole grid is omega <
+                # I_mu.  So a sub-unity weight IS the signature of a closed
+                # channel, which is how this was found.  See REVIEW.md [A-18].
+                out[:, cols] = 0.0
+                self.closed_subshells.add(key)
+                continue
             if omega_ev is not None:
                 # Substituting a *tabulated* sigma^AO for the computed dipole
                 # matrix element imports sigma's own normalisation: inverting
