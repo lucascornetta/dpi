@@ -391,7 +391,7 @@ def draw_spectrum(ax, grid, by_name, channels, total, args, xlo, xhi) -> None:
         # an independent intensity prediction.
         scaled = frozen * (np.nanmax(total) / np.nanmax(frozen))
         ax.plot(grid, scaled, color=FROZEN_COLOUR, lw=1.9, ls=":",
-                label="Frozen-orbital limit (scaled)", zorder=2)
+                label="Frozen-orbital limit", zorder=2)
         overlays.append(scaled)
 
     exp_energy = np.empty(0)

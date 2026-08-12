@@ -181,8 +181,8 @@ class StateSpec:
     """
 
 
-def build_state_specs(cfg: Config, log: Callable[[str], None]
-                      ) -> dict[str, list[StateSpec]]:
+def build_state_specs(cfg: Config, log: Callable[[str], None],
+                      frozen: bool = False) -> dict[str, list[StateSpec]]:
     """Pair energies with orbital files and assign each state its own DIP.
 
     The lowest state across all channels defines both the physical
@@ -191,15 +191,35 @@ def build_state_specs(cfg: Config, log: Callable[[str], None]
     relative to it.  Keeping these two shifts separate is the point: the
     first enters ``E_excess`` and therefore every cross section, the second
     only moves the plot.
+
+    With ``frozen=True`` the same pairing is done for the frozen-orbital
+    calculation, from ``paths.frozen_energies`` and
+    ``paths.frozen_orbitals``.  **The two sets are paired independently.**
+    A frozen-orbital calculation converges its states in its own order, and
+    nothing guarantees that its state 3 is the relaxed state 3 -- the
+    orbital files carry their own indices and are matched to their own
+    energy list, so a reordering between the two calculations cannot
+    silently pair a relaxed energy with a frozen orbital set.
+
+    The frozen ladder is referenced to the frozen set's **own** lowest
+    state, so both curves begin at ``true_dip_ev`` and their shapes are
+    directly comparable.  That discards the relaxation energy, which is
+    physically real, so the offset between the two references is computed
+    and reported rather than thrown away -- see
+    :func:`frozen_reference_offset`.
     """
-    raw = {ch: read_energies(cfg.paths.energies[ch], cfg.output.energies_unit)
+    energy_paths = (cfg.paths.frozen_energies if frozen
+                    else cfg.paths.energies)
+    orbital_paths = (cfg.paths.frozen_orbitals if frozen
+                     else cfg.paths.dication_orbitals)
+    raw = {ch: read_energies(energy_paths[ch], cfg.output.energies_unit)
            for ch in cfg.channels}
     e_ref = min(float(values.min()) for values in raw.values())
 
     # Orbital sets are keyed by multiplicity in BOTH coupling modes: MOLCAS
     # converges S_dic = 0 and S_dic = 1 separately and the j_C states are a
     # post-hoc recombination of the two, so no `jc32` orbital set exists.
-    orbitals = {key: collect_orbital_files(cfg.paths.dication_orbitals[key])
+    orbitals = {key: collect_orbital_files(orbital_paths[key])
                 for key in cfg.orbital_channels}
     jj = cfg.physics.coupling == "jj"
 
@@ -229,7 +249,8 @@ def build_state_specs(cfg: Config, log: Callable[[str], None]
                 triplet_path=path_t))
         specs[channel] = rows
         extra = sorted(set(indexed) - set(range(1, len(energies) + 1)))
-        log(f"  {channel:8s} {len(energies):3d} states, "
+        log(f"  {'[frozen] ' if frozen else ''}{channel:8s} "
+            f"{len(energies):3d} states, "
             f"{len(energies) - len(missing):3d} with orbitals, "
             f"E_shifted {rows[0].e_shifted_ev:.2f} .. "
             f"{rows[-1].e_shifted_ev:.2f} eV")
@@ -240,6 +261,44 @@ def build_state_specs(cfg: Config, log: Callable[[str], None]
             log(f"    orbital files with index {extra} exceed the "
                 f"{len(energies)} energies listed; ignored")
     return specs
+
+
+def frozen_reference_offset(cfg: Config) -> float | None:
+    """``E_lowest^frozen - E_lowest^relaxed`` in eV, or ``None``.
+
+    Both spectra are placed on their own internal ladder so their band
+    *shapes* are comparable (each starts at ``true_dip_ev``).  That is the
+    right choice for a diagnostic, but it discards a physically real
+    quantity: an unrelaxed dication lies **above** the relaxed one, because
+    relaxation is variational and can only lower the energy.  Rather than
+    lose it, the offset is computed here and reported in the run header and
+    the per-state table.
+
+    Returns ``None`` when the two energy lists are not on a common absolute
+    scale, which is detected rather than assumed: if either list is already
+    referenced to its own minimum (its smallest entry is 0 within
+    ``1e-9``), differencing the two minima is meaningless.  A negative
+    offset is returned but flagged by the caller, since relaxation lowering
+    the energy means the frozen minimum should be the higher of the two.
+    """
+    if not (cfg.paths.frozen_energies and cfg.paths.energies):
+        return None
+    unit = cfg.output.energies_unit
+    try:
+        relaxed = [read_energies(cfg.paths.energies[ch], unit)
+                   for ch in cfg.channels]
+        frozen = [read_energies(cfg.paths.frozen_energies[ch], unit)
+                  for ch in cfg.channels]
+    except Exception:
+        return None
+    lo_r = min(float(v.min()) for v in relaxed)
+    lo_f = min(float(v.min()) for v in frozen)
+    if abs(lo_r) < 1e-9 or abs(lo_f) < 1e-9:
+        # One of the lists is already relative to its own minimum, so the
+        # two minima do not share a zero and their difference is not a
+        # relaxation energy.
+        return None
+    return lo_f - lo_r
 
 
 # ── the calculation ─────────────────────────────────────────────────────────
@@ -268,7 +327,11 @@ def dyson_for_orbitals(orbital_path: str, index: int, cfg: Config,
     # block from the output.  See REVIEW.md [C-7].
     want = "|".join((
         f"lam={cfg.terms.indirect or cfg.terms.dir_ind_interference}",
-        f"frozen={cfg.physics.include_frozen}",
+        # The relaxed objects never carry a frozen sub-block now, so this
+        # component is constant; it stays in the signature so that caches
+        # written by the older code -- which DID attach one under
+        # include_frozen -- read as mismatched and are rebuilt.
+        "frozen=False",
     ))
     if os.path.isfile(cache):
         try:
@@ -288,7 +351,12 @@ def dyson_for_orbitals(orbital_path: str, index: int, cfg: Config,
         n_neu_occ=cfg.physics.n_neu_occ,
         holes=holes,
         dipole_ao=shared["dipole"],
-        include_frozen=cfg.physics.include_frozen,
+        # NOT cfg.physics.include_frozen: the frozen limit is now a separate
+        # calculation from its own orbital files (frozen_dyson_for_state), so
+        # attaching a frozen sub-block to every relaxed state would be dead
+        # work -- and would derive the holes from the RELAXED file, which is
+        # the mis-assignment the separate path exists to avoid.
+        include_frozen=False,
         meta={"index": index,
               "orbitals": os.path.basename(orbital_path)})
 
@@ -310,6 +378,56 @@ def dyson_for_state(spec: StateSpec, cfg: Config, shared: dict[str, Any],
     if spec.triplet_path is not None:
         secondary = dyson_for_orbitals(spec.triplet_path, spec.index, cfg,
                                        shared, log)
+    return primary, secondary
+
+
+def frozen_dyson_for_state(spec: StateSpec, cfg: Config,
+                           shared: dict[str, Any],
+                           log: Callable[[str], None]
+                           ) -> tuple[dyson.DysonObjects,
+                                      dyson.DysonObjects | None] | None:
+    """Frozen-limit Dyson objects, from the frozen calculation's own orbitals.
+
+    The frozen ``.RasOrb`` is read for one reason: it is the only record of
+    **which orbitals carry the holes** in that calculation.  Its
+    coefficients are (verifiably) the neutral ones up to a signed
+    permutation, so they add no orbital information -- but its ``#INDEX``
+    identifies the hole pair, and its state ordering need not match the
+    relaxed one.  Deriving the holes from the relaxed file instead would
+    silently mis-assign every state whenever the two calculations converge
+    in different orders, which is exactly the case this function exists for.
+
+    Objects are then built by :func:`dpi.dyson.frozen_objects` from the
+    **neutral** coefficients, which is what the frozen limit means: the
+    overlap matrix is a Kronecker delta, ``det(S_beta) = 1``, and the
+    two-electron Dyson minor is the frozen-orbital expression of note #4.
+    Passing the frozen file's own coefficients would give the same numbers
+    up to the permutation, so the neutral set is used and the frozen file is
+    the *check* on that assumption -- :func:`molcas_io.frozen_hole_indices`
+    refuses a file that is not a permutation.
+    """
+    if spec.orbital_path is None:
+        return None
+
+    expected = cfg.physics.frozen_expect_holes.get(spec.channel, {}).get(
+        spec.index)
+
+    def build(path: str) -> dyson.DysonObjects:
+        orb = molcas_io.read_inporb(path)
+        holes = molcas_io.frozen_hole_indices(
+            orb, shared["neutral"], shared["S_ao"], cfg.physics.n_neu_occ,
+            active_mos=cfg.physics.frozen_active_mos or None,
+            expect_holes=expected)
+        return dyson.frozen_objects(
+            shared["C_neu"], shared["S_ao"], cfg.physics.n_neu_occ,
+            holes.hole_i, holes.hole_j,
+            dipole_ao=shared["dipole"],
+            meta={"index": spec.index, "limit": "frozen",
+                  "orbitals": os.path.basename(path),
+                  "hole_i": holes.hole_i, "hole_j": holes.hole_j})
+
+    primary = build(spec.orbital_path)
+    secondary = build(spec.triplet_path) if spec.triplet_path else None
     return primary, secondary
 
 
@@ -358,11 +476,33 @@ def run(cfg: Config, log: Callable[[str], None]) -> dict[str, Any]:
         high_energy_exponents=cfg.physics.high_energy_exponent,
         threshold_overrides=cfg.physics.threshold_override,
         threshold_model=cfg.physics.threshold_model,
-        anchor_delta_ev=cfg.physics.anchor_delta_ev)
+        anchor_delta_ev=cfg.physics.anchor_delta_ev,
+        # Energy conservation against the REAL photon.  Without this the
+        # builder reads every subshell at hv = eps1 + I_mu >= I_mu, so an AO
+        # whose threshold exceeds omega still gets the cross section it would
+        # have at its own onset -- see REVIEW.md [A-18].
+        photon_energy_ev=cfg.physics.photon_energy_ev)
     assigned = getattr(sigma_builder, "n_assigned", None)
     if assigned is not None:
         log(f"  {assigned}/{nbas} AOs carry a tabulated atomic subshell; "
             f"the rest contribute zero cross section")
+    # `closed_subshells` is filled lazily, on the first at_eps1_grid call, so
+    # it is empty here.  Ask the thresholds directly instead: the criterion is
+    # just I_mu > omega and needs no evaluation.
+    closed = sorted(k for k in sigma_builder.subshells_used
+                    if sigma_builder.threshold_of(k)
+                    > cfg.physics.photon_energy_ev)
+    if closed:
+        # Reported, not fatal: at a soft edge some deep subshell legitimately
+        # sits above the photon energy and contributes nothing.  But if an AO
+        # carrying real dipole strength is closed, the photon energy and the
+        # state list probably belong to different edges.
+        pretty = ", ".join(
+            f"{k} (I_mu = {sigma_builder.threshold_of(k):.1f} eV)"
+            for k in closed)
+        log(f"  {len(closed)} subshell(s) are energetically CLOSED at "
+            f"omega = {cfg.physics.photon_energy_ev:.1f} eV and contribute "
+            f"zero: {pretty}  [REVIEW.md A-18]")
     unsafe = getattr(sigma_builder, "unsafe_extrapolations", lambda: ())()
     if unsafe:
         # Two independent things make a near-threshold estimate untrustworthy,
@@ -398,7 +538,8 @@ def run(cfg: Config, log: Callable[[str], None]) -> dict[str, Any]:
     log("pairing states with orbital files")
     specs = build_state_specs(cfg, log)
 
-    shared = {"C_neu": neutral.coeff, "S_ao": S_ao, "dipole": dipole}
+    shared = {"C_neu": neutral.coeff, "S_ao": S_ao, "dipole": dipole,
+              "neutral": neutral}
     results: dict[str, list[spectrum.StateResult]] = {}
     frozen_results: dict[str, list[spectrum.StateResult]] = {}
 
@@ -406,7 +547,6 @@ def run(cfg: Config, log: Callable[[str], None]) -> dict[str, Any]:
     for channel in cfg.channels:
         log(f"integrating {channel}")
         rows: list[spectrum.StateResult] = []
-        frozen_rows: list[spectrum.StateResult] = []
         closed = negative = 0
         for spec in specs[channel]:
             built = dyson_for_state(spec, cfg, shared, log)
@@ -423,19 +563,7 @@ def run(cfg: Config, log: Callable[[str], None]) -> dict[str, Any]:
             closed += not result.open
             negative += bool(getattr(result, "negative", False))
 
-            if cfg.physics.include_frozen and objects.frozen is not None:
-                frozen_rows.append(spectrum.integrate_state(
-                    objects.frozen, context, spec.dip_ev, channel,
-                    n_quad=cfg.physics.n_quad,
-                    dyson_triplet=(objects_t.frozen
-                                   if objects_t is not None else None),
-                    index=spec.index,
-                    e_dication_ev=spec.e_dication_ev,
-                    e_shifted_ev=spec.e_shifted_ev))
-
         results[channel] = rows
-        if frozen_rows:
-            frozen_results[channel] = frozen_rows
         total = sum(r.intensity for r in rows)
         log(f"  {len(rows)} states, sum of intensities {total:.6e}")
         if closed:
@@ -446,6 +574,82 @@ def run(cfg: Config, log: Callable[[str], None]) -> dict[str, Any]:
                 f"amplitude.  The singlet's -4 D_ij S_ij term can dominate "
                 f"when the two Dyson orbitals are not AO-orthogonal; this "
                 f"is a model breakdown, reported rather than clamped.")
+
+    # ── the frozen-orbital limit, as an INDEPENDENT calculation ────────────
+    #
+    # Not a by-product of the relaxed states: its own energy list, its own
+    # orbital files, its own state ordering, its own DIP ladder.  The two
+    # results are reported side by side and never summed -- they are the same
+    # spectrum computed under two different orbital assumptions, so adding
+    # them would double-count the process.
+    frozen_offset = None
+    if cfg.physics.include_frozen:
+        log("")
+        log("pairing frozen-orbital states with their own orbital files")
+        frozen_specs = build_state_specs(cfg, log, frozen=True)
+        frozen_offset = frozen_reference_offset(cfg)
+        if frozen_offset is None:
+            log("  the two energy lists are not on a common absolute scale, "
+                "so the relaxation energy cannot be reported")
+        else:
+            log(f"  E_lowest(frozen) - E_lowest(relaxed) = "
+                f"{frozen_offset:+.4f} eV")
+            if frozen_offset < 0.0:
+                log("  [!] the frozen minimum lies BELOW the relaxed one. "
+                    "Relaxation is variational and can only lower the "
+                    "energy, so either the lists are not comparable or the "
+                    "'relaxed' calculation is not converged.")
+        log("")
+        hole_log: list[tuple[str, int, int, int]] = []
+        for channel in cfg.channels:
+            log(f"integrating {channel} [frozen limit]")
+            frozen_rows: list[spectrum.StateResult] = []
+            for spec in frozen_specs[channel]:
+                built = frozen_dyson_for_state(spec, cfg, shared, log)
+                if built is None:
+                    continue
+                fobj, fobj_t = built
+                # Report which orbitals each state was holed in, with their
+                # neutral orbital energies.  No check on the amplitudes can
+                # catch a wrong hole -- in the frozen limit det(S_beta) = 1
+                # and p_i = p_j = 1 whatever orbitals are named, so every
+                # mis-assignment yields a well-formed, plausible number.
+                # Printing the depths makes it visible instead: a core hole
+                # at -26.4 Ha where -92.5 was intended stands out on sight.
+                hi = fobj.meta.get("hole_i")
+                hj = fobj.meta.get("hole_j")
+                if hi is not None:
+                    hole_log.append((channel, spec.index, hi, hj))
+                frozen_rows.append(spectrum.integrate_state(
+                    fobj, context, spec.dip_ev, channel,
+                    n_quad=cfg.physics.n_quad, dyson_triplet=fobj_t,
+                    index=spec.index,
+                    e_dication_ev=spec.e_dication_ev,
+                    e_shifted_ev=spec.e_shifted_ev))
+            if frozen_rows:
+                frozen_results[channel] = frozen_rows
+                log(f"  {len(frozen_rows)} states, sum of intensities "
+                    f"{sum(r.intensity for r in frozen_rows):.6e}")
+
+        if hole_log:
+            e_orb = getattr(neutral, "energies", None)
+            checked = cfg.physics.frozen_expect_holes
+            log("")
+            log("  frozen hole assignment (neutral MO, 1-based):")
+            for channel, index, hi, hj in hole_log:
+                mark = " [checked]" if index in checked.get(channel, {}) else ""
+                if e_orb is not None and e_orb.size > max(hi, hj):
+                    log(f"    {channel:8s} state {index:3d}: "
+                        f"core MO {hi + 1:3d} ({e_orb[hi]:9.3f} Ha)  "
+                        f"valence MO {hj + 1:3d} ({e_orb[hj]:8.3f} Ha)"
+                        f"{mark}")
+                else:
+                    log(f"    {channel:8s} state {index:3d}: "
+                        f"holes MO {hi + 1:3d}, {hj + 1:3d}{mark}")
+            n_checked = sum(len(r) for r in checked.values())
+            if n_checked:
+                log(f"    {n_checked} state(s) cross-checked against "
+                    f"frozen_expect_holes; the rest are unverified")
 
     # Quadrature convergence, on the strongest state of the first channel.
     first = cfg.channels[0]
@@ -467,10 +671,12 @@ def run(cfg: Config, log: Callable[[str], None]) -> dict[str, Any]:
             except Exception as exc:
                 log(f"  quadrature convergence check skipped: {exc}")
 
-    written = write_outputs(cfg, results, frozen_results, log)
+    written = write_outputs(cfg, results, frozen_results, log,
+                            frozen_offset=frozen_offset)
     log("")
     log(f"done in {time.time() - started:.1f} s")
-    return {"results": results, "frozen": frozen_results, "written": written}
+    return {"results": results, "frozen": frozen_results,
+            "frozen_offset": frozen_offset, "written": written}
 
 
 def _conv_value(conv: Any) -> float:
@@ -485,11 +691,17 @@ def _conv_value(conv: Any) -> float:
 def write_outputs(cfg: Config,
                   results: dict[str, list[spectrum.StateResult]],
                   frozen: dict[str, list[spectrum.StateResult]],
-                  log: Callable[[str], None]) -> list[str]:
+                  log: Callable[[str], None],
+                  frozen_offset: float | None = None) -> list[str]:
     """Broaden, then write spectrum.dat, sticks.dat and the LaTeX table."""
     os.makedirs(cfg.output.directory, exist_ok=True)
 
+    # The frozen states have their own positions, and they need not span the
+    # same range as the relaxed ones -- a frozen calculation can order its
+    # states differently and spread them differently.  Both sets must fit on
+    # one grid or the frozen curve would be silently truncated.
     positions = [r.e_shifted_ev for rows in results.values() for r in rows]
+    positions += [r.e_shifted_ev for rows in frozen.values() for r in rows]
     lo, hi = cfg.output.grid_bounds(positions)
     n_point = max(int(round((hi - lo) / cfg.output.e_step_ev)) + 1, 2)
     grid = np.linspace(lo, hi, n_point)
@@ -500,8 +712,15 @@ def write_outputs(cfg: Config,
         for channel, rows in results.items()}
 
     if frozen:
-        # The frozen limit is a shape reference, so it is emitted as a single
-        # summed column rather than per channel.
+        # The frozen limit is emitted as ONE total column, not per channel.
+        # Its singlet and triplet parts are essential to computing it -- the
+        # LS amplitudes differ and both are integrated -- but the frozen
+        # limit is used as a reference shape, and splitting it invites the
+        # reader to compare a frozen channel against a relaxed channel whose
+        # state ordering is unrelated.  Summing over channels HERE is the
+        # sum over the two spin couplings of one spectrum, which is
+        # physical; it is not a sum with the relaxed result, which would
+        # double-count the process.
         frozen_total = np.zeros_like(grid)
         for rows in frozen.values():
             frozen_total += spectrum.broaden(grid, rows,
@@ -518,10 +737,36 @@ def write_outputs(cfg: Config,
         "intensities are RELATIVE (Mb * a.u.); see REVIEW.md [P-6]",
         "E_shifted_eV = display_onset_ev + (E_f - E_lowest)",
         "the physics uses DIP_f = true_dip_ev + (E_f - E_lowest)"]
+    if frozen:
+        note += [
+            "",
+            "frozen_total is the FROZEN-ORBITAL limit: an independent "
+            "calculation with",
+            "its own energies, orbitals and state ordering.  It is a "
+            "reference, NOT a",
+            "contribution -- do not add it to the relaxed channels.",
+            "Each ladder is referenced to its OWN lowest state, so both "
+            "start at",
+            "true_dip_ev and their shapes are comparable."]
+        note.append(
+            "E_lowest(frozen) - E_lowest(relaxed) = "
+            f"{frozen_offset:+.4f} eV  [the relaxation energy, removed from "
+            f"both ladders]" if frozen_offset is not None else
+            "the relaxation energy could not be reported: the two energy "
+            "lists are not on a common absolute scale")
+
+    # `total` defaults to the sum over every column, which would fold the
+    # frozen-orbital limit into the relaxed result.  The two are the SAME
+    # spectrum under two orbital assumptions, so adding them double-counts
+    # the process: the total must be the sum over the RELAXED channels only.
+    relaxed_total = np.zeros_like(grid)
+    for channel in results:
+        relaxed_total += columns[channel]
 
     written: list[str] = []
     path = report.write_spectrum(cfg.out_path(cfg.output.spectrum), grid,
-                                columns, settings=settings, note=note)
+                                columns, settings=settings, note=note,
+                                total=relaxed_total)
     written.append(path)
     log(f"wrote {path}  ({n_point} points, "
         f"{len(columns)} channel column(s) + total)")
@@ -531,6 +776,29 @@ def write_outputs(cfg: Config,
                                settings=settings, note=note)
     written.append(path)
     log(f"wrote {path}  ({len(flat)} states)")
+
+    if frozen:
+        # A SEPARATE stick file, never merged into the relaxed one.  The
+        # frozen singlet and triplet rows are what the total is built from
+        # and are needed to check it, but their state indices refer to the
+        # frozen energy list -- index 3 there is not index 3 in the relaxed
+        # table -- so interleaving the two would invite exactly the
+        # cross-calculation comparison the separate ladders are meant to
+        # prevent.
+        flat_frozen = [r for channel in cfg.channels
+                       for r in frozen.get(channel, ())]
+        base, ext = os.path.splitext(cfg.output.sticks)
+        path = report.write_sticks(
+            cfg.out_path(f"{base}_frozen{ext}"), flat_frozen,
+            settings=settings,
+            note=list(note) + [
+                "",
+                "FROZEN-ORBITAL limit, per state.  `index` refers to the "
+                "frozen energy",
+                "list, which need not order its states as the relaxed "
+                "calculation does."])
+        written.append(path)
+        log(f"wrote {path}  ({len(flat_frozen)} frozen states)")
 
     if cfg.output.latex_table:
         path = report.write_latex_table(
@@ -592,6 +860,30 @@ def demo(directory: str, log: Callable[[str], None],
         with open(os.path.join(directory, f"e_{channel}.dat"), "w") as fh:
             fh.write("\n".join(f"{e:.10f}" for e in energies) + "\n")
 
+    # ── frozen-orbital inputs ──────────────────────────────────────────────
+    #
+    # Deliberately in a DIFFERENT state order from the relaxed list, and
+    # shifted up in energy.  Both are what a real frozen calculation gives:
+    # it converges its states independently, so its state 3 need not be the
+    # relaxed state 3, and being unrelaxed it lies above the relaxed set.
+    # A demo whose two orderings agreed would pass even if the code paired
+    # frozen orbitals against relaxed energies.
+    for key in orbital_keys:
+        orb_dir = os.path.join(directory, f"frozen_orb_{key}")
+        os.makedirs(orb_dir, exist_ok=True)
+        for k in range(1, n_state + 1):
+            target = os.path.join(orb_dir, f"state_{k}.RasOrb")
+            with open(case.inporb_frozen) as src, open(target, "w") as dst:
+                dst.write(src.read())
+    for channel in channels:
+        base = [-99.2 + 0.05 * (k - 1)
+                + (0.02 if channel in ("triplet", "jc12") else 0.0)
+                for k in range(1, n_state + 1)]
+        reordered = [base[i] for i in (1, 0, 3, 2)][:n_state]
+        with open(os.path.join(directory,
+                               f"e_frozen_{channel}.dat"), "w") as fh:
+            fh.write("\n".join(f"{e:.10f}" for e in reordered) + "\n")
+
     toml = [
         "[physics]",
         "photon_energy_ev = 300.0",
@@ -599,6 +891,11 @@ def demo(directory: str, log: Callable[[str], None],
         "n_neu_occ = 5",
         f'coupling = "{coupling}"',
         "n_quad = 120",
+        # The synthetic frozen file puts its two actives first, so the
+        # convention for it is [1, 2].  Stated explicitly rather than left to
+        # #INDEX so the demo exercises the cross-check that a real run
+        # depends on: with both present they must agree.
+        "frozen_active_mos = [1, 2]",
         "",
         "[paths]",
         f'neutral_orbitals = "{case.inporb_neutral}"',
@@ -610,6 +907,13 @@ def demo(directory: str, log: Callable[[str], None],
         "energies = { "
         + ", ".join(f'{c} = "{os.path.join(directory, "e_" + c + ".dat")}"'
                     for c in channels) + " }",
+        "frozen_orbitals = { "
+        + ", ".join(f'{c} = "{os.path.join(directory, "frozen_orb_" + c)}"'
+                    for c in orbital_keys) + " }",
+        "frozen_energies = { "
+        + ", ".join(
+            f'{c} = "{os.path.join(directory, "e_frozen_" + c + ".dat")}"'
+            for c in channels) + " }",
         f'cache_dir = "{os.path.join(directory, "cache")}"',
         "",
         "[output]",
